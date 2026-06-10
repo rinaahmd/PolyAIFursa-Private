@@ -181,6 +181,109 @@ def get_prediction_image(uid: str):
     return FileResponse(row[0])
 
 
+
+
+
+
+
+
+
+
+
+
+
+@app.get("/predictions/score/{min_score}")
+def get_predictions_by_score(min_score: float):
+    if min_score < 0.0 or min_score > 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail="min_score must be between 0.0 and 1.0"
+        )
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, prediction_uid, label, score, box
+        FROM detection_objects
+        WHERE score >= ?
+    """, (min_score,))
+
+    objects = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return objects
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@app.get("/predictions/label/")
+def get_predictions_by_empty_label():
+    raise HTTPException(status_code=400, detail="Label cannot be empty")
+
+@app.get("/predictions/label/{label}")
+def get_predictions_by_label(label: str):
+    if not label.strip():
+        raise HTTPException(status_code=400, detail="Label cannot be empty")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT DISTINCT p.uid, p.timestamp
+        FROM prediction_sessions p
+        JOIN detection_objects d ON p.uid = d.prediction_uid
+        WHERE d.label = ?
+    """, (label,))
+
+    predictions = cursor.fetchall()
+    result = []
+
+    for prediction in predictions:
+        cursor.execute("""
+            SELECT id, label, score, box
+            FROM detection_objects
+            WHERE prediction_uid = ? AND label = ?
+        """, (prediction["uid"], label))
+
+        objects = [dict(row) for row in cursor.fetchall()]
+
+        result.append({
+            "uid": prediction["uid"],
+            "timestamp": prediction["timestamp"],
+            "detection_objects": objects
+        })
+
+    conn.close()
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @app.get("/health")
 def health():
     """
