@@ -31,6 +31,7 @@ class TestPredictionsByLabel(unittest.TestCase):
         self.assertIsInstance(data, list)
         self.assertGreater(len(data), 0)
 
+
         self.assertIn("uid", data[0])
         self.assertIn("timestamp", data[0])
         self.assertIn("detection_objects", data[0])
