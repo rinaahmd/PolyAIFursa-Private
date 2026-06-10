@@ -51,3 +51,11 @@ class TestPredictionsByLabel(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"], "Label cannot be empty")
+        
+    def test_get_predictions_by_label_whitespace_label(self):
+        response = self.client.get("/predictions/label/   ")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Label cannot be empty")
+        
+    

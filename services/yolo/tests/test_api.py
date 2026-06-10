@@ -27,3 +27,11 @@ def test_health(client):
     assert response.json() == {"status": "ok"}
 
 
+def test_predict_rejects_non_image_file(client):
+    response = client.post(
+        "/predict",
+        files={"file": ("document.pdf", b"fake pdf content", "application/pdf")}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Only image files are supported"}
