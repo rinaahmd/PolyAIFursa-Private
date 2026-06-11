@@ -1,12 +1,13 @@
 import os
 import unittest
 import tempfile
+import numpy as np
+from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 import app as app_module
 from app import app, init_db
 
 TEST_IMAGE = os.path.join(os.path.dirname(__file__), "data", "beatles.jpeg")
-
 
 
 class TestPredictionsByScore(unittest.TestCase):
@@ -15,7 +16,35 @@ class TestPredictionsByScore(unittest.TestCase):
         init_db()
         self.client = TestClient(app)
 
-    def test_get_predictions_by_score_returns_objects(self):
+    def _mock_yolo_with_objects(self, mock_model, mock_image):
+        fake_person_box = MagicMock()
+        fake_person_box.cls = [MagicMock(item=lambda: 0)]
+        fake_person_box.conf = [0.95]
+        fake_person_box.xyxy = [MagicMock(tolist=lambda: [10, 20, 30, 40])]
+
+        fake_car_box = MagicMock()
+        fake_car_box.cls = [MagicMock(item=lambda: 1)]
+        fake_car_box.conf = [0.60]
+        fake_car_box.xyxy = [MagicMock(tolist=lambda: [50, 60, 70, 80])]
+
+        fake_result = MagicMock()
+        fake_result.boxes = [fake_person_box, fake_car_box]
+        fake_result.plot.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
+
+        mock_model.return_value = [fake_result]
+        mock_model.names = {
+            0: "person",
+            1: "car"
+        }
+
+        fake_image = MagicMock()
+        mock_image.fromarray.return_value = fake_image
+
+    @patch("app.Image")
+    @patch("app.model")
+    def test_get_predictions_by_score_returns_objects(self, mock_model, mock_image):
+        self._mock_yolo_with_objects(mock_model, mock_image)
+
         with open(TEST_IMAGE, "rb") as f:
             response = self.client.post(
                 "/predict",

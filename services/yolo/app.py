@@ -146,7 +146,7 @@ def predict(file: UploadFile = File(...)):
     }
 
 @app.get("/prediction/{uid}")
-def get_prediction_by_uid(uid: str): #pragma: no cover
+def get_prediction_by_uid(uid: str):  
     """
     Get prediction session by uid with all detected objects
     """
@@ -180,7 +180,7 @@ def get_prediction_by_uid(uid: str): #pragma: no cover
 
 
 @app.get("/prediction/{uid}/image")
-def get_prediction_image(uid: str): #pragma: no cover
+def get_prediction_image(uid: str):  
     """
     Return the annotated (bounding-box) image for a prediction
     """
