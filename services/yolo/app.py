@@ -9,7 +9,11 @@ import os
 import uuid
 import shutil
 import time
-##### check the deploy
+import signal
+import sys
+
+
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # Disable GPU usage
@@ -20,6 +24,51 @@ app = FastAPI()
 
 # Expose /metrics endpoint with default process metrics + FastAPI HTTP metrics
 Instrumentator().instrument(app).expose(app)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+is_shutting_down = False
+
+def handle_sigterm(signum, frame):
+    global is_shutting_down
+    is_shutting_down = True
+    logging.info("Received SIGTERM. Shutting down gracefully...")
+    logging.info("Cleanup done. Exiting.")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # Confidence threshold for object detection (0.0 - 1.0).
 # Detections below this score are discarded.
@@ -100,6 +149,22 @@ def save_detection_object(prediction_uid, label, score, box):
 def health():
     """Health check endpoint"""
     return {"status": "ok"}
+
+
+
+
+
+
+
+
+
+@app.get("/ready")
+def ready():
+    if is_shutting_down:
+        raise HTTPException(status_code=503, detail="Service is shutting down")
+    return {"status": "ready"}
+
+
 
 
 
