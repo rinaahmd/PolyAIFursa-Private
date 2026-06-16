@@ -9,7 +9,7 @@ import os
 import uuid
 import shutil
 import time
-
+##### check the deploy
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # Disable GPU usage
@@ -95,6 +95,15 @@ def save_detection_object(prediction_uid, label, score, box):
 
 
 
+# 1. Health - return service status for readiness checks
+@app.get("/health")
+def health():
+    """Health check endpoint"""
+    return {"status": "ok"}
+
+
+
+# 2. Predict - upload an image, run object detection, and save results
 @app.post("/predict")
 def predict(file: UploadFile = File(...)):
     """
@@ -155,11 +164,10 @@ def predict(file: UploadFile = File(...)):
 
 
 
+# 3. Get prediction by UID - return session details and detected objects
 @app.get("/prediction/{uid}")
-def get_prediction_by_uid(uid: str):  
-    """
-    Get prediction session by uid with all detected objects
-    """
+def get_prediction_by_uid(uid: str):
+    """Get prediction session by uid with all detected objects"""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         # Get prediction session
@@ -189,11 +197,10 @@ def get_prediction_by_uid(uid: str):
         }
 
 
+# 4. Get prediction image - return the annotated image file for a prediction
 @app.get("/prediction/{uid}/image")
-def get_prediction_image(uid: str):  
-    """
-    Return the annotated (bounding-box) image for a prediction
-    """
+def get_prediction_image(uid: str):
+    """Return the annotated (bounding-box) image for a prediction"""
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             "SELECT predicted_image FROM prediction_sessions WHERE uid = ?", (uid,)
@@ -214,6 +221,7 @@ def get_prediction_image(uid: str):
 
 
 
+# 5. Get predictions by score - list detection objects with score >= min_score
 @app.get("/predictions/score/{min_score}")
 def get_predictions_by_score(min_score: float):
     if min_score < 0.0 or min_score > 1.0:
@@ -251,11 +259,13 @@ def get_predictions_by_score(min_score: float):
 
 
 
+# 6. Get predictions by empty label - return error when no label is provided
 @app.get("/predictions/label/")
 def get_predictions_by_empty_label():
     raise HTTPException(status_code=400, detail="Label cannot be empty")
 
 
+# 7. Get predictions by label - return all predictions containing the given label
 @app.get("/predictions/label/{label}")
 def get_predictions_by_label(label: str):
     if not label.strip():
@@ -301,17 +311,6 @@ def get_predictions_by_label(label: str):
 
 
 
-
-
-
-
-
-@app.get("/health")
-def health():
-    """
-    Health check endpoint
-    """
-    return {"status": "ok"}
 
 if __name__ == "__main__":# pragma: no cover
     import uvicorn
