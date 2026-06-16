@@ -10,6 +10,7 @@ import uuid
 import shutil
 import time
 ##### check the deploy
+# test dev deployment
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # Disable GPU usage
