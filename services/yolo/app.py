@@ -151,6 +151,10 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/RINA")
+def rina():
+    """Health check endpoint"""
+    return {"status": "ok"}
 
 
 
