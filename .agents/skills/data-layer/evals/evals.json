@@ -1,0 +1,101 @@
+{
+"skill_name": "yolo-api-data-layer",
+"evals": [
+{
+"id": 1,
+"prompt": "refactor the api to use sqlalchemy",
+"expected_output": "Refactors the YOLO API database layer to SQLAlchemy while preserving all existing endpoints, status codes, and JSON response shapes. Creates or updates SQLAlchemy models for PredictionSession and DetectionObject, adds database session/configuration code, and removes raw sqlite3 usage from the application database layer.",
+"assertions": [
+"Uses SQLAlchemy ORM models",
+"Defines PredictionSession model",
+"Defines DetectionObject model",
+"Uses create_engine or equivalent SQLAlchemy engine setup",
+"Uses sessionmaker or equivalent SQLAlchemy session setup",
+"Existing endpoints keep the same response shape",
+"Does not use import sqlite3 in the application database layer",
+"Does not use raw SQL strings for normal CRUD operations"
+]
+},
+{
+"id": 2,
+"prompt": "make the database backend configurable so we can use postgres in production",
+"expected_output": "Adds environment-based database configuration that defaults to SQLite for development and supports PostgreSQL for production without changing endpoint code.",
+"assertions": [
+"Supports SQLite as the default backend",
+"Supports PostgreSQL configuration",
+"Reads database settings from environment variables",
+"Uses SQLAlchemy create_engine",
+"Does not hard-code only sqlite:///./predictions.db",
+"Endpoint code does not need to change when switching database backend"
+]
+},
+{
+"id": 3,
+"prompt": "add an endpoint GET /predictions/recent that returns the 10 most recent sessions",
+"expected_output": "Adds a GET /predictions/recent endpoint that returns the 10 most recent prediction sessions using SQLAlchemy ordering and limit logic, without changing existing endpoints.",
+"assertions": [
+"Adds GET /predictions/recent",
+"Returns at most 10 prediction sessions",
+"Orders sessions by timestamp descending",
+"Uses SQLAlchemy query logic",
+"Does not use raw SELECT SQL",
+"Adds or updates tests for the new endpoint",
+"Existing endpoints remain unchanged"
+]
+},
+{
+"id": 4,
+"prompt": "add a UserFeedback table to track user ratings per prediction",
+"expected_output": "Adds a SQLAlchemy UserFeedback model connected to prediction sessions and updates the database layer to support storing user ratings or feedback without changing existing prediction response shapes.",
+"assertions": [
+"Defines UserFeedback as a SQLAlchemy model",
+"Associates feedback with PredictionSession",
+"Includes rating field",
+"Includes prediction_uid or equivalent relationship field",
+"Does not change existing prediction response shapes unless explicitly requested",
+"Adds tests for feedback behavior"
+]
+},
+{
+"id": 5,
+"prompt": "delete a prediction session and all its detection objects by uid",
+"expected_output": "Implements deletion of a prediction session by uid and ensures all related detection objects are deleted using SQLAlchemy ORM behavior or relationships.",
+"assertions": [
+"Finds PredictionSession by uid",
+"Deletes the PredictionSession row",
+"Deletes related DetectionObject rows",
+"Uses SQLAlchemy ORM deletion",
+"Does not use raw DELETE SQL",
+"Handles missing uid with an appropriate error response",
+"Adds or updates tests for successful delete and missing uid"
+]
+},
+{
+"id": 6,
+"prompt": "add a column processing_time_ms to the prediction_sessions table",
+"expected_output": "Adds processing_time_ms to the SQLAlchemy PredictionSession model and updates the database write path and tests as needed while preserving existing API behavior unless the prompt explicitly requests a response change.",
+"assertions": [
+"Adds processing_time_ms to PredictionSession",
+"Stores processing time when creating a prediction session",
+"Keeps existing API response shapes unchanged unless explicitly requested",
+"Updates tests for the new column or stored value",
+"Does not introduce raw ALTER TABLE SQL unless migration handling is explicitly required"
+]
+},
+{
+"id": 7,
+"prompt": "write tests for the /predict endpoint after the sqlalchemy refactor",
+"expected_output": "Creates or updates pytest tests for POST /predict using FastAPI TestClient, mocked YOLO inference, and SQLAlchemy-compatible test database setup.",
+"assertions": [
+"Uses pytest",
+"Uses FastAPI TestClient",
+"Mocks YOLO model inference",
+"Uses a temporary test database",
+"Uses SQLAlchemy-compatible setup or dependency overrides",
+"Does not use sqlite3-specific test helpers",
+"Asserts response status code",
+"Asserts prediction_uid, detection_count, labels, and time_took fields"
+]
+}
+]
+}
