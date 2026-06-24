@@ -26,19 +26,16 @@ from pydantic import BaseModel
 
 YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://localhost:8080")
 MODEL = os.environ.get("MODEL")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 # Text-only models
-ALLOWED_MODELS = {
-    "openai:gpt-5.4-mini",
-    "anthropic:claude-haiku-4-5",
-}
 
-if MODEL not in ALLOWED_MODELS:
-    allowed_list = "\n  ".join(sorted(ALLOWED_MODELS))
-    raise SystemExit(
-        f"\n[ERROR] MODEL='{MODEL}' is not allowed.\n"
-        f"Set MODEL in your .env to one of the supported text-only models:\n  {allowed_list}\n"
-    )
+
+model = init_chat_model(
+    "amazon.nova-micro-v1:0",
+    model_provider="bedrock",
+    region_name="us-east-1",
+)
 
 SYSTEM_PROMPT = (
     "You are an AI vision assistant. You help users understand and analyze images. "
@@ -69,7 +66,12 @@ TOOLS = {
     detect_objects.name: detect_objects
 }
 
-llm = init_chat_model(MODEL, temperature=0)
+llm = init_chat_model(
+    MODEL,
+    model_provider="bedrock",
+    region_name=AWS_REGION,
+    temperature=0,
+)
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
 
@@ -87,6 +89,8 @@ def run_agent(history: list, max_iterations: int = 10) -> str:
 
     for _ in range(max_iterations):
         response: AIMessage = llm_with_tools.invoke(messages)
+        print("TOOL CALLS:", response.tool_calls)
+        print("CONTENT:", response.content)
         messages.append(response)
 
         # No tool calls, the model produced its final answer
