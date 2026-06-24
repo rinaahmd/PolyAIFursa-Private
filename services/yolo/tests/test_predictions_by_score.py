@@ -5,6 +5,7 @@ import numpy as np
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 import app as app_module
+import db
 from app import app, init_db
 
 TEST_IMAGE = os.path.join(os.path.dirname(__file__), "data", "beatles.jpeg")
@@ -12,7 +13,7 @@ TEST_IMAGE = os.path.join(os.path.dirname(__file__), "data", "beatles.jpeg")
 
 class TestPredictionsByScore(unittest.TestCase):
     def setUp(self):
-        _, app_module.DB_PATH = tempfile.mkstemp(suffix=".db")
+        _, db.DB_PATH = tempfile.mkstemp(suffix=".db")
         init_db()
         self.client = TestClient(app)
 
