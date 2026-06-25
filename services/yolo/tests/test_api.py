@@ -1,8 +1,11 @@
 import os
 import pytest
+import db
+import app as app_module
 from fastapi.testclient import TestClient
 import numpy as np
 from unittest.mock import MagicMock
+from models import DetectionObject, PredictionSession
 
 os.environ.setdefault("CONFIDENCE_THRESHOLD", "0.5")
 
@@ -117,3 +120,52 @@ def test_get_prediction_image_not_found(client):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Image not found"
+
+
+def test_rina_endpoint(client):
+    response = client.get("/RINA")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_ready_endpoint_returns_503_when_shutting_down(client, monkeypatch):
+    monkeypatch.setattr(app_module, "is_shutting_down", True)
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Service is shutting down"
+
+
+def test_format_timestamp_returns_none_for_missing_timestamp():
+    assert app_module._format_timestamp(None) is None
+
+
+def test_handle_sigterm_sets_shutdown_and_exits():
+    app_module.is_shutting_down = False
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            app_module.handle_sigterm(0, None)
+
+        assert exc_info.value.code == 0
+        assert app_module.is_shutting_down is True
+    finally:
+        app_module.is_shutting_down = False
+
+
+def test_get_predictions_by_label_skips_missing_prediction_session(client):
+    missing_uid = "missing-session-uid"
+    with db.SessionLocal() as session:
+        session.add(DetectionObject(
+            prediction_uid=missing_uid,
+            label="person",
+            score=0.75,
+            box="[0, 0, 1, 1]"
+        ))
+        session.commit()
+
+    response = client.get("/predictions/label/person")
+
+    assert response.status_code == 200
+    assert response.json() == []

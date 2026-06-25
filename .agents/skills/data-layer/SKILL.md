@@ -7,16 +7,7 @@ description: Use this skill when the YOLO FastAPI service requires SQLAlchemy da
 
 Use this skill for database and model changes in the YOLO service that must switch from raw SQLite to SQLAlchemy or extend the SQLAlchemy data model.
 
-## When to use
 
-- "refactor the api to use sqlalchemy"
-- "add an endpoint GET /predictions/recent that returns the 10 most recent sessions"
-- "add a UserFeedback table to track user ratings per prediction"
-- "write tests for the /predict endpoint"
-- "the database layer doesn't follow our architectural design, fix it"
-- "delete a prediction session and all its detection objects by uid"
-- "add a column processing_time_ms to the prediction_sessions table"
-- "make the database backend configurable so we can use postgres in production"
 
 ## What this skill must produce
 
@@ -32,9 +23,12 @@ Use this skill for database and model changes in the YOLO service that must swit
 - Use model classes for tables: `PredictionSession` and `DetectionObject`
 - Map `PredictionSession` to `prediction_sessions` and `DetectionObject` to `detection_objects`
 - Use `db.add(...)`, `db.commit()`, `db.query(...).filter_by(...)`, `.order_by(...)`, `.limit(...)`, and SQLAlchemy deletion semantics
-- Configure database backend with environment variables: `DB_BACKEND`, `DB_USER`, `DB_PASSWORD`
+- Configure database backend with environment variables: `DB_BACKEND`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, and `DB_NAME`
 - Default to SQLite `sqlite:///./predictions.db`; use PostgreSQL URL only when `DB_BACKEND == "postgres"`
 - Apply `connect_args={"check_same_thread": False}` only for SQLite
+- Update `services/yolo/requirements.txt` when new database libraries are needed:
+  - `sqlalchemy>=2.0.0` for the ORM
+  - `psycopg2-binary>=2.9.0` when adding or validating PostgreSQL backend support
 
 ## Testing guidance
 
