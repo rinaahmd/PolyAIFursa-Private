@@ -111,8 +111,11 @@ app = FastAPI(title="Vision Agent")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_methods=["POST", "GET"],
+   allow_origins=[
+        "http://localhost:3000",
+        "http://YOUR_EC2_PUBLIC_IP:3000",
+        "http://rina-dev.fursa.click:3000",
+    ],    allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
 
