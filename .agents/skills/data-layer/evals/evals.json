@@ -1,0 +1,86 @@
+{
+  "skill_name": "yolo-api-data-layer",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "refactor the api to use sqlalchemy",
+      "expected_output": "Creates services/yolo/models.py and services/yolo/db.py; updates services/yolo/app.py to use SQLAlchemy ORM models and Dependencies; removes sqlite3 and raw SQL; preserves all existing endpoints, status codes, and response shapes.",
+      "assertions": [
+        "models.py contains declarative_base() and PredictionSession/DetectionObject ORM classes",
+        "db.py contains create_engine, SessionLocal, get_db, and backend configuration logic",
+        "app.py uses Depends(get_db) and SQLAlchemy session queries instead of raw SQL",
+        "no import sqlite3, no conn.execute(...), no init_db()"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "add an endpoint GET /predictions/recent that returns the 10 most recent sessions",
+      "expected_output": "Adds /predictions/recent in services/yolo/app.py using SQLAlchemy to return the 10 most recent sessions ordered by timestamp, and adds pytest HTTP tests asserting status 200 and the returned JSON array shape.",
+      "assertions": [
+        "endpoint uses db.query(PredictionSession).order_by(...).limit(10)",
+        "tests call /predictions/recent and assert 200 and a JSON array",
+        "response objects preserve the existing prediction session fields"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "add a UserFeedback table to track user ratings per prediction",
+      "expected_output": "Creates a UserFeedback SQLAlchemy model in services/yolo/models.py linked to prediction_sessions, updates the data layer to support feedback storage, and adds tests verifying the new model and relation.",
+      "assertions": [
+        "models.py defines UserFeedback with a relationship or foreign key to PredictionSession",
+        "data layer uses ORM inserts/querying for feedback",
+        "tests verify feedback creation and association without raw SQL"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "write tests for the /predict endpoint",
+      "expected_output": "Creates or updates pytest HTTP tests for /predict using FastAPI TestClient against services/yolo/app.py, asserting status 200 and the correct prediction JSON structure after the SQLAlchemy refactor.",
+      "assertions": [
+        "tests use FastAPI TestClient and the YOLO app instance",
+        "tests assert /predict returns 200 and expected JSON fields",
+        "no raw sqlite3 queries are used in the tests"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "the database layer doesn't follow our architectural design, fix it",
+      "expected_output": "Moves database logic into services/yolo/db.py and models.py, removes raw SQL and sqlite3 usage from services/yolo/app.py, and preserves unchanged API behavior.",
+      "assertions": [
+        "db.py owns connection/session setup",
+        "models.py owns ORM table definitions",
+        "app.py imports get_db and executes ORM queries only"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "delete a prediction session and all its detection objects by uid",
+      "expected_output": "Adds a SQLAlchemy-backed delete operation that removes a prediction session and its detection objects by uid, and adds tests confirming deletion and the endpoint response.",
+      "assertions": [
+        "delete operation removes both the session and related detection rows",
+        "tests verify the session no longer exists after deletion",
+        "logic uses ORM deletion semantics not raw SQL"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "add a column processing_time_ms to the prediction_sessions table",
+      "expected_output": "Adds processing_time_ms to the PredictionSession SQLAlchemy model, updates insert/update logic, and adds tests asserting the new field is persisted and returned in API responses.",
+      "assertions": [
+        "models.py includes processing_time_ms on PredictionSession",
+        "API responses include processing_time_ms where sessions are returned",
+        "tests validate the new field is present"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "make the database backend configurable so we can use postgres in production",
+      "expected_output": "Updates services/yolo/db.py to choose SQLite or Postgres via DB_BACKEND, DB_USER, and DB_PASSWORD, with SQLite default and SQLite-only connect_args check_same_thread=False.",
+      "assertions": [
+        "db.py checks DB_BACKEND and builds a Postgres URL when configured",
+        "SQLite fallback uses sqlite:///./predictions.db",
+        "connect_args is applied only for SQLite"
+      ]
+    }
+  ]
+}
