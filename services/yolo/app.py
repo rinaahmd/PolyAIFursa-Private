@@ -1,5 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi.responses import FileResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from ultralytics import YOLO
 from PIL import Image
@@ -20,7 +22,6 @@ from models import DetectionObject, PredictionSession
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # Disable GPU usage
-import torch
 torch.cuda.is_available = lambda: False
 
 app = FastAPI()
@@ -58,6 +59,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PREDICTED_DIR, exist_ok=True)
 
 # Download the AI model (tiny model ~6MB)
+model = YOLO("yolov8n.pt")
 model = YOLO("yolov8n.pt")
 
 
@@ -116,6 +118,7 @@ def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db))
     start_time = time.time()
     ext = os.path.splitext(file.filename)[1]
 
+
     uid = str(uuid.uuid4())
     original_path = os.path.join(UPLOAD_DIR, uid + ext)
     predicted_path = os.path.join(PREDICTED_DIR, uid + ext)
@@ -125,6 +128,7 @@ def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db))
 
     results = model(original_path, device="cpu", conf=CONFIDENCE_THRESHOLD)
 
+    annotated_frame = results[0].plot()
     annotated_frame = results[0].plot()
     annotated_image = Image.fromarray(annotated_frame)
     annotated_image.save(predicted_path)
@@ -141,9 +145,12 @@ def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db))
         detected_labels.append(label)
 
     db_session.commit()
+
+    db_session.commit()
     processing_time = round(time.time() - start_time, 2)
 
     return {
+        "prediction_uid": uid,
         "prediction_uid": uid,
         "detection_count": len(results[0].boxes),
         "labels": detected_labels,
