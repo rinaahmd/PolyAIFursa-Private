@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 import numpy as np
@@ -96,6 +97,18 @@ def test_get_prediction_by_uid(client, monkeypatch):
     assert len(data["detection_objects"]) == 1
     assert data["detection_objects"][0]["label"] == "person"
     assert data["detection_objects"][0]["score"] == 0.95
+
+
+def test_get_prediction_timestamp_is_persisted(client, monkeypatch):
+    uid = create_prediction_with_mock(client, monkeypatch)
+
+    response = client.get(f"/prediction/{uid}")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["timestamp"] is not None
+    assert isinstance(data["timestamp"], str)
+    datetime.fromisoformat(data["timestamp"])
 
 
 def test_get_prediction_by_uid_not_found(client):
