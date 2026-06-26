@@ -1,7 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.responses import FileResponse
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
-from fastapi.responses import FileResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from ultralytics import YOLO
 from PIL import Image
@@ -13,10 +11,11 @@ import time
 import signal
 import sys
 
+import torch
 from sqlalchemy.orm import Session, selectinload
 
 import db
-from db import init_db, get_db
+from db import get_db
 from models import DetectionObject, PredictionSession
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -60,7 +59,12 @@ os.makedirs(PREDICTED_DIR, exist_ok=True)
 
 # Download the AI model (tiny model ~6MB)
 model = YOLO("yolov8n.pt")
-model = YOLO("yolov8n.pt")
+
+
+def init_db(db_path: str | None = None):
+    from db import init_db as db_init
+
+    db_init(db_path)
 
 
 def _format_timestamp(timestamp):
@@ -129,7 +133,6 @@ def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db))
     results = model(original_path, device="cpu", conf=CONFIDENCE_THRESHOLD)
 
     annotated_frame = results[0].plot()
-    annotated_frame = results[0].plot()
     annotated_image = Image.fromarray(annotated_frame)
     annotated_image.save(predicted_path)
 
@@ -145,12 +148,9 @@ def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db))
         detected_labels.append(label)
 
     db_session.commit()
-
-    db_session.commit()
     processing_time = round(time.time() - start_time, 2)
 
     return {
-        "prediction_uid": uid,
         "prediction_uid": uid,
         "detection_count": len(results[0].boxes),
         "labels": detected_labels,
