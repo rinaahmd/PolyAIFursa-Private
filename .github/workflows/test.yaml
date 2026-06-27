@@ -44,7 +44,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install Agent dependencies
-        run: pip install -r services/agent/requirements.txt
+        run: |
+          pip install pytest
+          pip install -r services/agent/requirements.txt
 
       - name: Run agent tests
         run: pytest tests/ -q
