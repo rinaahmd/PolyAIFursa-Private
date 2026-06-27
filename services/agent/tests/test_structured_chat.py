@@ -153,6 +153,65 @@ def test_run_agent_does_not_crash_on_invalid_tool_json(monkeypatch):
     assert data["tokens_used"] == {"input": None, "output": None, "total": None}
 
 
+def test_run_agent_filters_reasoning_blocks_and_embedded_images(monkeypatch):
+    monkeypatch.setattr(
+        agent_app,
+        "llm_with_tools",
+        FakeLLMWithTools(
+            [
+                AIMessage(
+                    content=[
+                        {
+                            "type": "reasoning_content",
+                            "reasoning_content": {
+                                "text": "internal chain of thought",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Here is what is in the image.\n\n"
+                                "![annotated](data:image/jpeg;base64,ZmFrZQ==)"
+                            ),
+                        },
+                    ],
+                    tool_calls=[],
+                )
+            ]
+        ),
+    )
+
+    data = agent_app.run_agent([HumanMessage(content="describe image")])
+
+    assert data["response"] == "Here is what is in the image."
+    assert data["prediction_id"] is None
+    assert data["annotated_image"] is None
+
+
+def test_run_agent_filters_plain_text_thinking_tags(monkeypatch):
+    monkeypatch.setattr(
+        agent_app,
+        "llm_with_tools",
+        FakeLLMWithTools(
+            [
+                AIMessage(
+                    content=(
+                        "<thinking>internal chain of thought</thinking>\n\n"
+                        "The image contains the following objects:\n\n"
+                        "- 5 persons\n"
+                        "- 4 cars"
+                    ),
+                    tool_calls=[],
+                )
+            ]
+        ),
+    )
+
+    data = agent_app.run_agent([HumanMessage(content="describe image")])
+
+    assert data["response"] == "The image contains the following objects:\n\n- 5 persons\n- 4 cars"
+
+
 def test_extract_usage_metadata_handles_partial_keys():
     class FakeResponse:
         usage_metadata = {"input_tokens": 6}

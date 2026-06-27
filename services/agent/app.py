@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from contextlib import suppress
 from contextvars import ContextVar
@@ -208,18 +209,35 @@ def _get_llm_with_tools():
 
 def _stringify_content(content) -> str:
     if isinstance(content, str):
-        return content
+        return _sanitize_response_text(content)
     if isinstance(content, list):
         text_parts = []
         for item in content:
-            if isinstance(item, dict) and isinstance(item.get("text"), str):
-                text_parts.append(item["text"])
-            else:
-                text_parts.append(str(item))
-        return "\n".join(text_parts)
+            item_text = _content_item_text(item)
+            if item_text:
+                text_parts.append(item_text)
+        return _sanitize_response_text("\n".join(text_parts))
     if content is None:
         return ""
-    return str(content)
+    return _sanitize_response_text(str(content))
+
+
+def _content_item_text(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        text = item.get("text")
+        if isinstance(text, str):
+            return text
+        return ""
+    return ""
+
+
+def _sanitize_response_text(text: str) -> str:
+    cleaned = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"!\[[^\]]*\]\(data:image/[^)]+\)", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _parse_tool_json(content) -> Optional[dict]:
