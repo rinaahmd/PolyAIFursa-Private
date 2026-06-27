@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.tools import tool
 from pydantic import BaseModel
 
@@ -175,11 +176,20 @@ def _sum_optional(current: int | None, addition: int | None) -> int | None:
         return addition
     return current + addition
 
+
+# Client-side throttling helps reduce bursty calls that can trigger provider 429 limits.
+rate_limiter = InMemoryRateLimiter(
+    requests_per_second=0.2,
+    check_every_n_seconds=0.1,
+    max_bucket_size=2,
+)
+
 llm = init_chat_model(
     MODEL,
     model_provider="bedrock",
     region_name=AWS_REGION,
     temperature=0,
+    rate_limiter=rate_limiter,
 )
 llm_profile = validate_model_profile(llm, MODEL or "unknown")
 llm_max_input_tokens = _coerce_int(llm_profile.get("max_input_tokens"))
