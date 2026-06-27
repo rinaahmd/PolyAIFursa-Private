@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from ultralytics import YOLO
 from PIL import Image
+from pydantic import BaseModel
 import logging
 import os
 import uuid
@@ -29,6 +30,13 @@ app = FastAPI()
 Instrumentator().instrument(app).expose(app)
 
 is_shutting_down = False
+
+
+class PredictResponse(BaseModel):
+    prediction_uid: str
+    detection_count: int
+    labels: list[str]
+    time_took: float
 
 
 def handle_sigterm(signum, frame):
@@ -113,7 +121,7 @@ def ready():
 
 
 # 2. Predict - upload an image, run object detection, and save results
-@app.post("/predict")
+@app.post("/predict", response_model=PredictResponse)
 def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db)):
     allowed_extensions = (".jpg", ".jpeg", ".png")
     if not file.filename.lower().endswith(allowed_extensions):
@@ -150,12 +158,12 @@ def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db))
     db_session.commit()
     processing_time = round(time.time() - start_time, 2)
 
-    return {
-        "prediction_uid": uid,
-        "detection_count": len(results[0].boxes),
-        "labels": detected_labels,
-        "time_took": processing_time,
-    }
+    return PredictResponse(
+        prediction_uid=uid,
+        detection_count=len(results[0].boxes),
+        labels=detected_labels,
+        time_took=processing_time,
+    )
 
 
 # 3. Get prediction by UID - return session details and detected objects

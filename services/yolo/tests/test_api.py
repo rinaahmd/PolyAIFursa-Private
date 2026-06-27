@@ -168,6 +168,49 @@ def test_predict_response_has_zero_detections_when_model_returns_none(client, mo
     assert data["detection_count"] == 0
     assert data["labels"] == []
 
+
+def test_predict_response_shape_matches_contract(client, monkeypatch):
+    fake_box = MagicMock()
+    fake_box.cls = [MagicMock(item=lambda: 0)]
+    fake_box.conf = [0.95]
+    fake_box.xyxy = [MagicMock(tolist=lambda: [10, 20, 30, 40])]
+
+    fake_result = MagicMock()
+    fake_result.boxes = [fake_box]
+    fake_result.plot.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    fake_model = MagicMock()
+    fake_model.return_value = [fake_result]
+    fake_model.names = {0: "person"}
+
+    fake_image = MagicMock()
+
+    def save_to_disk(path, *args, **kwargs):
+        open(path, "wb").close()
+
+    fake_image.save.side_effect = save_to_disk
+
+    fake_image_module = MagicMock()
+    fake_image_module.fromarray.return_value = fake_image
+
+    monkeypatch.setattr("app.model", fake_model)
+    monkeypatch.setattr("app.Image", fake_image_module)
+
+    with open(TEST_IMAGE, "rb") as f:
+        response = client.post(
+            "/predict",
+            files={"file": ("beatles.jpeg", f, "image/jpeg")}
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data.keys()) == {"prediction_uid", "detection_count", "labels", "time_took"}
+    assert isinstance(data["prediction_uid"], str)
+    assert isinstance(data["detection_count"], int)
+    assert isinstance(data["labels"], list)
+    assert all(isinstance(label, str) for label in data["labels"])
+    assert isinstance(data["time_took"], (int, float))
+
 def test_get_prediction_image(client, monkeypatch):
     uid = create_prediction_with_mock(client, monkeypatch)
 
