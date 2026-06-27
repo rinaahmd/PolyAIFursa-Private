@@ -31,15 +31,6 @@ YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://localhost:8080")
 MODEL = os.environ.get("MODEL")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
-# Text-only models
-
-
-model = init_chat_model(
-    "amazon.nova-micro-v1:0",
-    model_provider="bedrock",
-    region_name="us-east-1",
-)
-
 SYSTEM_PROMPT = (
     "You are an AI vision assistant. You help users understand and analyze images. "
     "Use the available tools to extract information from images. "
@@ -184,16 +175,35 @@ rate_limiter = InMemoryRateLimiter(
     max_bucket_size=2,
 )
 
-llm = init_chat_model(
-    MODEL,
-    model_provider="bedrock",
-    region_name=AWS_REGION,
-    temperature=0,
-    rate_limiter=rate_limiter,
-)
-llm_profile = validate_model_profile(llm, MODEL or "unknown")
-llm_max_input_tokens = _coerce_int(llm_profile.get("max_input_tokens"))
-llm_with_tools = llm.bind_tools(list(TOOLS.values()))
+llm = None
+llm_profile: dict[str, Any] = {}
+llm_max_input_tokens: int | None = None
+llm_with_tools = None
+
+
+def _initialize_llm() -> None:
+    initialized_llm = init_chat_model(
+        MODEL,
+        model_provider="bedrock",
+        region_name=AWS_REGION,
+        temperature=0,
+        rate_limiter=rate_limiter,
+    )
+    initialized_profile = validate_model_profile(initialized_llm, MODEL or "unknown")
+    globals().update(
+        {
+            "llm": initialized_llm,
+            "llm_profile": initialized_profile,
+            "llm_max_input_tokens": _coerce_int(initialized_profile.get("max_input_tokens")),
+            "llm_with_tools": initialized_llm.bind_tools(list(TOOLS.values())),
+        }
+    )
+
+
+def _get_llm_with_tools():
+    if llm_with_tools is None:
+        _initialize_llm()
+    return llm_with_tools
 
 
 def _stringify_content(content) -> str:
@@ -256,10 +266,11 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     total_output_tokens: int | None = None
     total_tokens: int | None = None
     token_limit_risk = False
+    active_llm_with_tools = _get_llm_with_tools()
 
     for _ in range(max_iterations):
         iterations += 1
-        response: AIMessage = llm_with_tools.invoke(messages)
+        response: AIMessage = active_llm_with_tools.invoke(messages)
         usage = _extract_usage_metadata(response)
         total_input_tokens = _sum_optional(total_input_tokens, usage["input"])
         total_output_tokens = _sum_optional(total_output_tokens, usage["output"])
