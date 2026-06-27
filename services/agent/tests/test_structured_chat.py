@@ -6,9 +6,8 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 import app as agent_app
 
-
-@pytest.fixture
-def api_client():
+@pytest.fixture(name="api_client")
+def fixture_api_client():
     return TestClient(agent_app.app)
 
 
@@ -29,7 +28,15 @@ def test_chat_returns_structured_response_without_tool_calls(api_client, monkeyp
     monkeypatch.setattr(
         agent_app,
         "llm_with_tools",
-        FakeLLMWithTools([AIMessage(content="hello", tool_calls=[])]),
+        FakeLLMWithTools(
+            [
+                AIMessage(
+                    content="hello",
+                    tool_calls=[],
+                    usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+            ]
+        ),
     )
 
     response = api_client.post(
@@ -46,6 +53,7 @@ def test_chat_returns_structured_response_without_tool_calls(api_client, monkeyp
     assert data["iterations"] == 1
     assert data["tools_called"] == []
     assert data["context_limit_exceeded"] is False
+    assert data["tokens_used"] == {"input": 10, "output": 5, "total": 15}
 
 
 def test_chat_sets_context_limit_exceeded_on_max_iterations(api_client, monkeypatch):
@@ -74,14 +82,20 @@ def test_chat_sets_context_limit_exceeded_on_max_iterations(api_client, monkeypa
     assert data["iterations"] == 10
     assert data["tools_called"] == ["unknown_tool"] * 10
     assert data["context_limit_exceeded"] is True
+    assert data["tokens_used"] == {"input": None, "output": None, "total": None}
 
 
 def test_chat_extracts_prediction_id_and_annotated_image(api_client, monkeypatch):
     first = AIMessage(
         content="calling tool",
+        usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
         tool_calls=[{"id": "tool-1", "name": "detect_objects", "args": {}}],
     )
-    second = AIMessage(content="done", tool_calls=[])
+    second = AIMessage(
+        content="done",
+        tool_calls=[],
+        usage_metadata={"input_tokens": 9, "output_tokens": 4, "total_tokens": 13},
+    )
     monkeypatch.setattr(agent_app, "llm_with_tools", FakeLLMWithTools([first, second]))
 
     class FakeDetectObjectsTool:
@@ -115,6 +129,7 @@ def test_chat_extracts_prediction_id_and_annotated_image(api_client, monkeypatch
     assert data["annotated_image"] == "ZmFrZS1pbWFnZQ=="
     assert data["tools_called"] == ["detect_objects"]
     assert data["context_limit_exceeded"] is False
+    assert data["tokens_used"] == {"input": 16, "output": 7, "total": 23}
 
 
 def test_chat_does_not_crash_on_invalid_tool_json(api_client, monkeypatch):
@@ -145,3 +160,28 @@ def test_chat_does_not_crash_on_invalid_tool_json(api_client, monkeypatch):
     assert data["annotated_image"] is None
     assert data["tools_called"] == ["detect_objects"]
     assert data["context_limit_exceeded"] is False
+    assert data["tokens_used"] == {"input": None, "output": None, "total": None}
+
+
+def test_extract_usage_metadata_handles_partial_keys():
+    class FakeResponse:
+        usage_metadata = {"input_tokens": 6}
+
+    usage = agent_app._extract_usage_metadata(FakeResponse())
+    assert usage == {"input": 6, "output": None, "total": None}
+
+
+def test_model_profile_validation_fails_when_tool_calling_disabled():
+    class FakeModel:
+        profile = {"tool_calling": False, "structured_output": True}
+
+    with pytest.raises(RuntimeError, match="tool_calling"):
+        agent_app.validate_model_profile(FakeModel(), "fake-model")
+
+
+def test_model_profile_validation_allows_missing_structured_output_key():
+    class FakeModel:
+        profile = {"tool_calling": True}
+
+    profile = agent_app.validate_model_profile(FakeModel(), "fake-model")
+    assert profile["tool_calling"] is True

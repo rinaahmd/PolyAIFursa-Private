@@ -4,8 +4,9 @@ import json
 import logging
 import os
 import time
+from contextlib import suppress
 from contextvars import ContextVar
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -67,12 +68,121 @@ TOOLS = {
     detect_objects.name: detect_objects
 }
 
+
+def _profile_to_dict(profile: Any) -> dict[str, Any]:
+    if isinstance(profile, dict):
+        return profile
+    if profile is None:
+        return {}
+
+    for method_name in ("model_dump", "dict"):
+        method = getattr(profile, method_name, None)
+        if callable(method):
+            dumped = method()
+            if isinstance(dumped, dict):
+                return dumped
+
+    try:
+        values = vars(profile)
+    except TypeError:
+        return {}
+
+    if isinstance(values, dict):
+        return {k: v for k, v in values.items() if not k.startswith("_")}
+    return {}
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return None
+
+
+def _pick_first_int(data: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        if key in data:
+            value = _coerce_int(data.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def validate_model_profile(model_obj: Any, model_name: str) -> dict[str, Any]:
+    profile = _profile_to_dict(getattr(model_obj, "profile", None))
+
+    if profile.get("tool_calling") is not True:
+        raise RuntimeError(
+            f"Model '{model_name}' is incompatible: missing required feature 'tool_calling=True' in llm.profile."
+        )
+
+    # Some providers/version pairs do not expose structured_output in profile.
+    # We only enforce it when the key exists.
+    if "structured_output" in profile and profile.get("structured_output") is not True:
+        raise RuntimeError(
+            f"Model '{model_name}' is incompatible: missing required feature 'structured_output=True' in llm.profile."
+        )
+
+    return profile
+
+
+def _extract_usage_metadata(response: AIMessage) -> dict[str, int | None]:
+    usage = getattr(response, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        return {"input": None, "output": None, "total": None}
+
+    input_tokens = _pick_first_int(
+        usage,
+        (
+            "input_tokens",
+            "inputTokens",
+            "input_token_count",
+            "inputTokenCount",
+        ),
+    )
+    output_tokens = _pick_first_int(
+        usage,
+        (
+            "output_tokens",
+            "outputTokens",
+            "output_token_count",
+            "outputTokenCount",
+        ),
+    )
+    total_tokens = _pick_first_int(
+        usage,
+        (
+            "total_tokens",
+            "totalTokens",
+            "total_token_count",
+            "totalTokenCount",
+        ),
+    )
+    return {"input": input_tokens, "output": output_tokens, "total": total_tokens}
+
+
+def _sum_optional(current: int | None, addition: int | None) -> int | None:
+    if addition is None:
+        return current
+    if current is None:
+        return addition
+    return current + addition
+
 llm = init_chat_model(
     MODEL,
     model_provider="bedrock",
     region_name=AWS_REGION,
     temperature=0,
 )
+llm_profile = validate_model_profile(llm, MODEL or "unknown")
+llm_max_input_tokens = _coerce_int(llm_profile.get("max_input_tokens"))
 llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
 
@@ -132,10 +242,24 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     annotated_image: Optional[str] = None
     context_limit_exceeded = False
     final_response = ""
+    total_input_tokens: int | None = None
+    total_output_tokens: int | None = None
+    total_tokens: int | None = None
+    token_limit_risk = False
 
     for _ in range(max_iterations):
         iterations += 1
         response: AIMessage = llm_with_tools.invoke(messages)
+        usage = _extract_usage_metadata(response)
+        total_input_tokens = _sum_optional(total_input_tokens, usage["input"])
+        total_output_tokens = _sum_optional(total_output_tokens, usage["output"])
+        total_tokens = _sum_optional(total_tokens, usage["total"])
+
+        if llm_max_input_tokens is not None and usage["input"] is not None:
+            near_limit_threshold = int(llm_max_input_tokens * 0.9)
+            if usage["input"] >= near_limit_threshold:
+                token_limit_risk = True
+
         print("TOOL CALLS:", response.tool_calls)
         print("CONTENT:", response.content)
         messages.append(response)
@@ -160,12 +284,14 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 messages.append(tool_result)
                 continue
 
-            try:
+            tool_result = None
+            with suppress(Exception):
                 tool_result = tool_fn.invoke(tool_call)
-            except Exception as tool_exc:  # noqa: BLE001 - tool failures must not crash chat
+
+            if tool_result is None:
                 tool_result = ToolMessage(
                     tool_call_id=tool_call.get("id", "unknown"),
-                    content=json.dumps({"error": f"Tool execution failed: {tool_exc}"}),
+                    content=json.dumps({"error": "Tool execution failed."}),
                 )
 
             messages.append(tool_result)
@@ -181,6 +307,11 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         context_limit_exceeded = True
         final_response = "Agent stopped because it reached the maximum number of tool iterations."
 
+    if token_limit_risk:
+        logging.warning(
+            "Model input token usage was near or above max_input_tokens for at least one loop iteration."
+        )
+
     return {
         "response": final_response,
         "prediction_id": prediction_id,
@@ -189,6 +320,11 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         "iterations": iterations,
         "tools_called": tools_called,
         "context_limit_exceeded": context_limit_exceeded,
+        "tokens_used": {
+            "input": total_input_tokens,
+            "output": total_output_tokens,
+            "total": total_tokens,
+        },
     }
 
 
@@ -216,6 +352,12 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage]         # full conversation thread, oldest first
 
 
+class TokenUsage(BaseModel):
+    input: int | None = None
+    output: int | None = None
+    total: int | None = None
+
+
 class ChatResponse(BaseModel):
     response: str
     prediction_id: str | None = None
@@ -224,6 +366,7 @@ class ChatResponse(BaseModel):
     iterations: int
     tools_called: list[str]
     context_limit_exceeded: bool
+    tokens_used: TokenUsage
 
 
 @app.post("/chat", response_model=ChatResponse)
