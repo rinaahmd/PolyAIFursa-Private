@@ -1,4 +1,5 @@
 import os
+import uuid
 from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
@@ -30,14 +31,24 @@ def test_health(client):
     assert response.json() == {"status": "ok"}
 
 
-def test_predict_rejects_non_image_file(client):
+def test_predict_rejects_non_image_key(client):
     response = client.post(
         "/predict",
-        files={"file": ("document.pdf", b"fake pdf content", "application/pdf")}
+        json={"image_s3_key": "chat/pred/original/document.pdf", "prediction_id": str(uuid.uuid4())},
     )
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Only image files are supported"}
+
+
+def _mock_s3_transfer(monkeypatch):
+    def fake_download(_s3_key, local_path):
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(TEST_IMAGE, "rb") as src, open(local_path, "wb") as dst:
+            dst.write(src.read())
+
+    monkeypatch.setattr("app.download_file_from_s3", fake_download)
+    monkeypatch.setattr("app.upload_file_to_s3", lambda _local_path, _s3_key: None)
 
 def create_prediction_with_mock(client, monkeypatch):
     fake_box = MagicMock()
@@ -64,11 +75,15 @@ def create_prediction_with_mock(client, monkeypatch):
     monkeypatch.setattr("app.model", fake_model)
     monkeypatch.setattr("app.Image", fake_image_module)
 
-    with open(TEST_IMAGE, "rb") as f:
-        response = client.post(
-            "/predict",
-            files={"file": ("beatles.jpeg", f, "image/jpeg")}
-        )
+    _mock_s3_transfer(monkeypatch)
+    prediction_id = str(uuid.uuid4())
+    response = client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
 
     assert response.status_code == 200
     return response.json()["prediction_uid"]
@@ -157,11 +172,15 @@ def test_predict_response_has_zero_detections_when_model_returns_none(client, mo
     monkeypatch.setattr("app.model", fake_model)
     monkeypatch.setattr("app.Image", fake_image_module)
 
-    with open(TEST_IMAGE, "rb") as f:
-        response = client.post(
-            "/predict",
-            files={"file": ("beatles.jpeg", f, "image/jpeg")}
-        )
+    _mock_s3_transfer(monkeypatch)
+    prediction_id = str(uuid.uuid4())
+    response = client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
 
     assert response.status_code == 200
     data = response.json()
@@ -196,11 +215,15 @@ def test_predict_response_shape_matches_contract(client, monkeypatch):
     monkeypatch.setattr("app.model", fake_model)
     monkeypatch.setattr("app.Image", fake_image_module)
 
-    with open(TEST_IMAGE, "rb") as f:
-        response = client.post(
-            "/predict",
-            files={"file": ("beatles.jpeg", f, "image/jpeg")}
-        )
+    _mock_s3_transfer(monkeypatch)
+    prediction_id = str(uuid.uuid4())
+    response = client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
 
     assert response.status_code == 200
     data = response.json()

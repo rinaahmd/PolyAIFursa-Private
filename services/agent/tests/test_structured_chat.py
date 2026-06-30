@@ -1,4 +1,6 @@
 import json
+import base64
+import re
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -234,3 +236,74 @@ def test_model_profile_validation_allows_missing_structured_output_key():
 
     profile = agent_app.validate_model_profile(FakeModel(), "fake-model")
     assert profile["tool_calling"] is True
+
+
+def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
+    captured = {}
+
+    def fake_upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "image/jpeg"):
+        captured["uploaded_data"] = data
+        captured["uploaded_key"] = s3_key
+        captured["content_type"] = content_type
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "prediction_uid": "pred-123",
+                "detection_count": 1,
+                "labels": ["person"],
+                "time_took": 0.1,
+            }
+
+    class FakeHttpxClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["post_kwargs"] = kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", fake_upload_bytes_to_s3)
+    monkeypatch.setattr(agent_app.httpx, "Client", FakeHttpxClient)
+
+    image_bytes = b"fake-image-bytes"
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    image_token = agent_app._current_image_b64.set(image_b64)
+    chat_token = agent_app._current_chat_id.set("chat-42")
+    try:
+        raw = agent_app.detect_objects.invoke({})
+    finally:
+        agent_app._current_chat_id.reset(chat_token)
+        agent_app._current_image_b64.reset(image_token)
+
+    payload = json.loads(raw)
+    assert payload["prediction_uid"] == "pred-123"
+
+    assert captured["uploaded_data"] == image_bytes
+    assert captured["content_type"] == "image/jpeg"
+    assert captured["url"] == f"{agent_app.YOLO_SERVICE_URL}/predict"
+
+    post_kwargs = captured["post_kwargs"]
+    assert "files" not in post_kwargs
+    assert "json" in post_kwargs
+
+    body = post_kwargs["json"]
+    assert set(body.keys()) == {"image_s3_key", "prediction_id"}
+    prediction_id = body["prediction_id"]
+    assert isinstance(prediction_id, str)
+    assert re.fullmatch(r"[0-9a-fA-F-]{36}", prediction_id)
+
+    expected_key = f"chat-42/{prediction_id}/original/image.jpg"
+    assert body["image_s3_key"] == expected_key
+    assert captured["uploaded_key"] == expected_key

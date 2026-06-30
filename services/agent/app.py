@@ -1,14 +1,15 @@
 import base64
-import io
 import json
 import logging
 import os
 import re
 import time
+import uuid
 from contextlib import suppress
 from contextvars import ContextVar
 from typing import Any, Optional
 
+import boto3
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -30,7 +31,8 @@ from pydantic import BaseModel
 
 YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://localhost:8080")
 MODEL = os.environ.get("MODEL")
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+AWS_REGION = os.environ.get("AWS_REGION")
+AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET")
 
 SYSTEM_PROMPT = (
     "You are an AI vision assistant. You help users understand and analyze images. "
@@ -38,6 +40,17 @@ SYSTEM_PROMPT = (
 )
 
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
+_current_chat_id: ContextVar[Optional[str]] = ContextVar("current_chat_id", default=None)
+
+
+def _upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "image/jpeg") -> None:
+    if not AWS_REGION:
+        raise RuntimeError("AWS_REGION environment variable is required")
+    if not AWS_S3_BUCKET:
+        raise RuntimeError("AWS_S3_BUCKET environment variable is required")
+
+    s3_client = boto3.client("s3", region_name=AWS_REGION)
+    s3_client.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=data, ContentType=content_type)
 
 @tool
 def detect_objects() -> str:
@@ -46,11 +59,20 @@ def detect_objects() -> str:
     if not image_b64:
         return json.dumps({"error": "No image was provided by the user."})
 
-    image_bytes = base64.b64decode(image_b64)
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        prediction_id = str(uuid.uuid4())
+        chat_id = (_current_chat_id.get() or "chat").strip() or "chat"
+        filename = "image.jpg"
+        image_s3_key = f"{chat_id}/{prediction_id}/original/{filename}"
+        _upload_bytes_to_s3(image_bytes, image_s3_key)
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to upload image to S3: {exc}"})
+
     with httpx.Client(timeout=30.0) as client:
         response = client.post(
             f"{YOLO_SERVICE_URL}/predict",
-            files={"file": ("image.jpg", io.BytesIO(image_bytes), "image/jpeg")},
+            json={"image_s3_key": image_s3_key, "prediction_id": prediction_id},
         )
         response.raise_for_status()
     return json.dumps(response.json())
@@ -389,6 +411,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]         # full conversation thread, oldest first
+    chat_id: str | None = None
 
 
 class TokenUsage(BaseModel):
@@ -424,11 +447,13 @@ def chat(request: ChatRequest):
         else:
             lc_messages.append(AIMessage(content=msg.content))
 
-    token = _current_image_b64.set(latest_image)
+    image_token = _current_image_b64.set(latest_image)
+    chat_token = _current_chat_id.set(request.chat_id)
     try:
         return ChatResponse(**run_agent(lc_messages))
     finally:
-        _current_image_b64.reset(token)
+        _current_chat_id.reset(chat_token)
+        _current_image_b64.reset(image_token)
 
 
 @app.get("/health")

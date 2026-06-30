@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import FileResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from ultralytics import YOLO
@@ -6,8 +6,6 @@ from PIL import Image
 from pydantic import BaseModel
 import logging
 import os
-import uuid
-import shutil
 import time
 import signal
 import sys
@@ -18,6 +16,7 @@ from sqlalchemy.orm import Session, selectinload
 import db
 from db import get_db
 from models import DetectionObject, PredictionSession
+from s3_utils import download_file_from_s3, upload_file_to_s3
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -37,6 +36,11 @@ class PredictResponse(BaseModel):
     detection_count: int
     labels: list[str]
     time_took: float
+
+
+class PredictRequest(BaseModel):
+    image_s3_key: str
+    prediction_id: str
 
 
 def handle_sigterm(signum, frame):
@@ -122,21 +126,26 @@ def ready():
 
 # 2. Predict - upload an image, run object detection, and save results
 @app.post("/predict", response_model=PredictResponse)
-def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db)):
+def predict(request: PredictRequest, db_session: Session = Depends(get_db)):
     allowed_extensions = (".jpg", ".jpeg", ".png")
-    if not file.filename.lower().endswith(allowed_extensions):
+    image_s3_key = request.image_s3_key.strip()
+    if not image_s3_key:
+        raise HTTPException(status_code=400, detail="Only image files are supported")
+
+    source_filename = os.path.basename(image_s3_key)
+    if not source_filename.lower().endswith(allowed_extensions):
         raise HTTPException(status_code=400, detail="Only image files are supported")
 
     start_time = time.time()
-    ext = os.path.splitext(file.filename)[1]
+    ext = os.path.splitext(source_filename)[1]
+    uid = request.prediction_id.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="prediction_id is required")
 
-
-    uid = str(uuid.uuid4())
     original_path = os.path.join(UPLOAD_DIR, uid + ext)
     predicted_path = os.path.join(PREDICTED_DIR, uid + ext)
 
-    with open(original_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    download_file_from_s3(image_s3_key, original_path)
 
     results = model(original_path, device="cpu", conf=CONFIDENCE_THRESHOLD)
 
@@ -144,7 +153,14 @@ def predict(file: UploadFile = File(...), db_session: Session = Depends(get_db))
     annotated_image = Image.fromarray(annotated_frame)
     annotated_image.save(predicted_path)
 
-    save_prediction_session(db_session, uid, original_path, predicted_path)
+    if "/original/" not in image_s3_key:
+        raise HTTPException(status_code=400, detail="image_s3_key must contain /original/")
+
+    predicted_s3_key = image_s3_key.replace("/original/", "/predicted/", 1)
+
+    upload_file_to_s3(predicted_path, predicted_s3_key)
+
+    save_prediction_session(db_session, uid, image_s3_key, predicted_s3_key)
 
     detected_labels = []
     for box in results[0].boxes:
@@ -201,9 +217,25 @@ def get_prediction_by_uid(uid: str, db_session: Session = Depends(get_db)):
 @app.get("/prediction/{uid}/image")
 def get_prediction_image(uid: str, db_session: Session = Depends(get_db)):
     prediction = db_session.get(PredictionSession, uid)
-    if not prediction or not os.path.exists(prediction.predicted_image):
+    if not prediction:
         raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(prediction.predicted_image)
+
+    predicted_ref = prediction.predicted_image
+
+    if os.path.exists(predicted_ref):
+        return FileResponse(predicted_ref)
+
+    try:
+        ext = os.path.splitext(os.path.basename(predicted_ref))[1] or ".jpg"
+        local_path = os.path.join(PREDICTED_DIR, f"{uid}_download{ext}")
+        download_file_from_s3(predicted_ref, local_path)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    if not os.path.exists(local_path):
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return FileResponse(local_path)
 
 
 # 5. Get predictions by score - list detection objects with score >= min_score
