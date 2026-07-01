@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from contextvars import ContextVar
 from typing import Any, Optional
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -61,21 +63,34 @@ def detect_objects() -> str:
 
     try:
         image_bytes = base64.b64decode(image_b64)
-        prediction_id = str(uuid.uuid4())
-        chat_id = (_current_chat_id.get() or "chat").strip() or "chat"
-        filename = "image.jpg"
-        image_s3_key = f"{chat_id}/{prediction_id}/original/{filename}"
+    except (binascii.Error, ValueError) as exc:
+        return json.dumps({"error": f"Invalid image encoding: {exc}"})
+
+    prediction_id = str(uuid.uuid4())
+    chat_id = (_current_chat_id.get() or "chat").strip() or "chat"
+    filename = "image.jpg"
+    image_s3_key = f"{chat_id}/{prediction_id}/original/{filename}"
+
+    try:
         _upload_bytes_to_s3(image_bytes, image_s3_key)
-    except Exception as exc:
+    except RuntimeError as exc:
+        return json.dumps({"error": f"S3 configuration error: {exc}"})
+    except (BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError) as exc:
         return json.dumps({"error": f"Failed to upload image to S3: {exc}"})
 
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(
-            f"{YOLO_SERVICE_URL}/predict",
-            json={"image_s3_key": image_s3_key, "prediction_id": prediction_id},
-        )
-        response.raise_for_status()
-    return json.dumps(response.json())
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(
+                f"{YOLO_SERVICE_URL}/predict",
+                json={"image_s3_key": image_s3_key, "prediction_id": prediction_id},
+            )
+            response.raise_for_status()
+        return json.dumps(response.json())
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text if exc.response is not None else str(exc)
+        return json.dumps({"error": f"YOLO service returned an error: {detail}"})
+    except httpx.HTTPError as exc:
+        return json.dumps({"error": f"Failed to call YOLO service: {exc}"})
 
 
 # Registry: map tool name -> tool function

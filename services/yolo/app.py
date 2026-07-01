@@ -145,7 +145,15 @@ def predict(request: PredictRequest, db_session: Session = Depends(get_db)):
     original_path = os.path.join(UPLOAD_DIR, uid + ext)
     predicted_path = os.path.join(PREDICTED_DIR, uid + ext)
 
-    download_file_from_s3(image_s3_key, original_path)
+    if "/original/" not in image_s3_key:
+        raise HTTPException(status_code=400, detail="image_s3_key must contain /original/")
+
+    try:
+        download_file_from_s3(image_s3_key, original_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"S3 configuration error: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to download image from S3: {exc}") from exc
 
     results = model(original_path, device="cpu", conf=CONFIDENCE_THRESHOLD)
 
@@ -153,12 +161,14 @@ def predict(request: PredictRequest, db_session: Session = Depends(get_db)):
     annotated_image = Image.fromarray(annotated_frame)
     annotated_image.save(predicted_path)
 
-    if "/original/" not in image_s3_key:
-        raise HTTPException(status_code=400, detail="image_s3_key must contain /original/")
-
     predicted_s3_key = image_s3_key.replace("/original/", "/predicted/", 1)
 
-    upload_file_to_s3(predicted_path, predicted_s3_key)
+    try:
+        upload_file_to_s3(predicted_path, predicted_s3_key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"S3 configuration error: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to upload image to S3: {exc}") from exc
 
     save_prediction_session(db_session, uid, image_s3_key, predicted_s3_key)
 
@@ -229,8 +239,10 @@ def get_prediction_image(uid: str, db_session: Session = Depends(get_db)):
         ext = os.path.splitext(os.path.basename(predicted_ref))[1] or ".jpg"
         local_path = os.path.join(PREDICTED_DIR, f"{uid}_download{ext}")
         download_file_from_s3(predicted_ref, local_path)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Image not found")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"S3 configuration error: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Image not found") from exc
 
     if not os.path.exists(local_path):
         raise HTTPException(status_code=404, detail="Image not found")

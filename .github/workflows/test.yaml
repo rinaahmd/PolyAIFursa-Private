@@ -79,3 +79,31 @@ jobs:
         with:
           command: cves
           image: rinaahmd/yolo-service:ci-scan
+
+      - name: Build Agent Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: services/agent
+          push: false
+          load: true
+          tags: rinaahmd/agent-service:ci-scan
+
+      - name: Docker Scout CVE scan (Agent)
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: rinaahmd/agent-service:ci-scan
+
+      - name: Build Frontend Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: services/frontend
+          push: false
+          load: true
+          tags: rinaahmd/frontend-service:ci-scan
+
+      - name: Docker Scout CVE scan (Frontend)
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: rinaahmd/frontend-service:ci-scan
