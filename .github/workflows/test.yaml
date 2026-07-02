@@ -4,8 +4,8 @@ on:
   pull_request:
     branches:
       - main
-      - dev
-permissions:
+      
+ permissions:
   contents: read
   pull-requests: write
 jobs:
@@ -33,6 +33,8 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: services/yolo/coverage.xml
+          flags: yolo
+          name: yolo-py312
           fail_ci_if_error: true
 
   test-agent:

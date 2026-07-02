@@ -21,18 +21,18 @@ def setup_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def client():
+def api_client():
     return TestClient(app)
 
 
-def test_health(client):
-    response = client.get("/health")
+def test_health(api_client):
+    response = api_client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_predict_rejects_non_image_key(client):
-    response = client.post(
+def test_predict_rejects_non_image_key(api_client):
+    response = api_client.post(
         "/predict",
         json={"image_s3_key": "chat/pred/original/document.pdf", "prediction_id": str(uuid.uuid4())},
     )
@@ -50,7 +50,8 @@ def _mock_s3_transfer(monkeypatch):
     monkeypatch.setattr("app.download_file_from_s3", fake_download)
     monkeypatch.setattr("app.upload_file_to_s3", lambda _local_path, _s3_key: None)
 
-def create_prediction_with_mock(client, monkeypatch):
+
+def _mock_model_and_image(monkeypatch):
     fake_box = MagicMock()
     fake_box.cls = [MagicMock(item=lambda: 0)]
     fake_box.conf = [0.95]
@@ -65,8 +66,10 @@ def create_prediction_with_mock(client, monkeypatch):
     fake_model.names = {0: "person"}
 
     fake_image = MagicMock()
-    def save_to_disk(path, *args, **kwargs):
+
+    def save_to_disk(path):
         open(path, "wb").close()
+
     fake_image.save.side_effect = save_to_disk
 
     fake_image_module = MagicMock()
@@ -75,9 +78,12 @@ def create_prediction_with_mock(client, monkeypatch):
     monkeypatch.setattr("app.model", fake_model)
     monkeypatch.setattr("app.Image", fake_image_module)
 
+def create_prediction_with_mock(api_client, monkeypatch):
+    _mock_model_and_image(monkeypatch)
+
     _mock_s3_transfer(monkeypatch)
     prediction_id = str(uuid.uuid4())
-    response = client.post(
+    response = api_client.post(
         "/predict",
         json={
             "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
@@ -94,10 +100,10 @@ def create_prediction_with_mock(client, monkeypatch):
 
 
 
-def test_get_prediction_by_uid(client, monkeypatch):
-    uid = create_prediction_with_mock(client, monkeypatch)
+def test_get_prediction_by_uid(api_client, monkeypatch):
+    uid = create_prediction_with_mock(api_client, monkeypatch)
 
-    response = client.get(f"/prediction/{uid}")
+    response = api_client.get(f"/prediction/{uid}")
 
     assert response.status_code == 200
     data = response.json()
@@ -114,10 +120,10 @@ def test_get_prediction_by_uid(client, monkeypatch):
     assert data["detection_objects"][0]["score"] == 0.95
 
 
-def test_get_prediction_timestamp_is_persisted(client, monkeypatch):
-    uid = create_prediction_with_mock(client, monkeypatch)
+def test_get_prediction_timestamp_is_persisted(api_client, monkeypatch):
+    uid = create_prediction_with_mock(api_client, monkeypatch)
 
-    response = client.get(f"/prediction/{uid}")
+    response = api_client.get(f"/prediction/{uid}")
     assert response.status_code == 200
 
     data = response.json()
@@ -126,33 +132,33 @@ def test_get_prediction_timestamp_is_persisted(client, monkeypatch):
     datetime.fromisoformat(data["timestamp"])
 
 
-def test_get_prediction_by_uid_not_found(client):
-    response = client.get("/prediction/not-existing-uid")
+def test_get_prediction_by_uid_not_found(api_client):
+    response = api_client.get("/prediction/not-existing-uid")
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Prediction not found"
 
 
-def test_rina_endpoint(client):
-    response = client.get("/RINA")
+def test_rina_endpoint(api_client):
+    response = api_client.get("/RINA")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_ready_endpoint_when_running(client):
-    response = client.get("/ready")
+def test_ready_endpoint_when_running(api_client):
+    response = api_client.get("/ready")
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
 
 
-def test_ready_endpoint_when_shutting_down(client, monkeypatch):
+def test_ready_endpoint_when_shutting_down(api_client, monkeypatch):
     monkeypatch.setattr("app.is_shutting_down", True)
-    response = client.get("/ready")
+    response = api_client.get("/ready")
     assert response.status_code == 503
     assert response.json()["detail"] == "Service is shutting down"
 
 
-def test_predict_response_has_zero_detections_when_model_returns_none(client, monkeypatch):
+def test_predict_response_has_zero_detections_when_model_returns_none(api_client, monkeypatch):
     fake_result = MagicMock()
     fake_result.boxes = []
     fake_result.plot.return_value = __import__("numpy").zeros((100, 100, 3), dtype=__import__("numpy").uint8)
@@ -162,7 +168,7 @@ def test_predict_response_has_zero_detections_when_model_returns_none(client, mo
     fake_model.names = {}
 
     fake_image = MagicMock()
-    def save_to_disk(path, *args, **kwargs):
+    def save_to_disk(path):
         open(path, "wb").close()
     fake_image.save.side_effect = save_to_disk
 
@@ -174,7 +180,7 @@ def test_predict_response_has_zero_detections_when_model_returns_none(client, mo
 
     _mock_s3_transfer(monkeypatch)
     prediction_id = str(uuid.uuid4())
-    response = client.post(
+    response = api_client.post(
         "/predict",
         json={
             "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
@@ -188,7 +194,7 @@ def test_predict_response_has_zero_detections_when_model_returns_none(client, mo
     assert data["labels"] == []
 
 
-def test_predict_response_shape_matches_contract(client, monkeypatch):
+def test_predict_response_shape_matches_contract(api_client, monkeypatch):
     fake_box = MagicMock()
     fake_box.cls = [MagicMock(item=lambda: 0)]
     fake_box.conf = [0.95]
@@ -204,7 +210,7 @@ def test_predict_response_shape_matches_contract(client, monkeypatch):
 
     fake_image = MagicMock()
 
-    def save_to_disk(path, *args, **kwargs):
+    def save_to_disk(path):
         open(path, "wb").close()
 
     fake_image.save.side_effect = save_to_disk
@@ -217,7 +223,7 @@ def test_predict_response_shape_matches_contract(client, monkeypatch):
 
     _mock_s3_transfer(monkeypatch)
     prediction_id = str(uuid.uuid4())
-    response = client.post(
+    response = api_client.post(
         "/predict",
         json={
             "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
@@ -234,16 +240,130 @@ def test_predict_response_shape_matches_contract(client, monkeypatch):
     assert all(isinstance(label, str) for label in data["labels"])
     assert isinstance(data["time_took"], (int, float))
 
-def test_get_prediction_image(client, monkeypatch):
-    uid = create_prediction_with_mock(client, monkeypatch)
+def test_get_prediction_image(api_client, monkeypatch):
+    uid = create_prediction_with_mock(api_client, monkeypatch)
 
-    response = client.get(f"/prediction/{uid}/image")
+    response = api_client.get(f"/prediction/{uid}/image")
 
     assert response.status_code == 200
 
 
-def test_get_prediction_image_not_found(client):
-    response = client.get("/prediction/not-existing-uid/image")
+def test_get_prediction_image_not_found(api_client):
+    response = api_client.get("/prediction/not-existing-uid/image")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Image not found"
+
+
+def test_predict_rejects_key_without_original_segment(api_client):
+    prediction_id = str(uuid.uuid4())
+    response = api_client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/incoming/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "image_s3_key must contain /original/"}
+
+
+def test_predict_returns_503_on_runtime_download_error(api_client, monkeypatch):
+    monkeypatch.setattr("app.download_file_from_s3", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("missing AWS config")))
+
+    prediction_id = str(uuid.uuid4())
+    response = api_client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
+
+    assert response.status_code == 503
+    assert "S3 configuration error" in response.json()["detail"]
+
+
+def test_predict_returns_502_on_unexpected_download_error(api_client, monkeypatch):
+    monkeypatch.setattr("app.download_file_from_s3", lambda *_args, **_kwargs: (_ for _ in ()).throw(Exception("network boom")))
+
+    prediction_id = str(uuid.uuid4())
+    response = api_client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
+
+    assert response.status_code == 502
+    assert "Failed to download image from S3" in response.json()["detail"]
+
+
+def test_predict_returns_503_on_runtime_upload_error(api_client, monkeypatch):
+    _mock_model_and_image(monkeypatch)
+
+    def fake_download(_s3_key, local_path):
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(TEST_IMAGE, "rb") as src, open(local_path, "wb") as dst:
+            dst.write(src.read())
+
+    monkeypatch.setattr("app.download_file_from_s3", fake_download)
+    monkeypatch.setattr("app.upload_file_to_s3", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("missing AWS config")))
+
+    prediction_id = str(uuid.uuid4())
+    response = api_client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
+
+    assert response.status_code == 503
+    assert "S3 configuration error" in response.json()["detail"]
+
+
+def test_predict_returns_502_on_unexpected_upload_error(api_client, monkeypatch):
+    _mock_model_and_image(monkeypatch)
+
+    def fake_download(_s3_key, local_path):
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(TEST_IMAGE, "rb") as src, open(local_path, "wb") as dst:
+            dst.write(src.read())
+
+    monkeypatch.setattr("app.download_file_from_s3", fake_download)
+    monkeypatch.setattr("app.upload_file_to_s3", lambda *_args, **_kwargs: (_ for _ in ()).throw(Exception("upload failed")))
+
+    prediction_id = str(uuid.uuid4())
+    response = api_client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
+
+    assert response.status_code == 502
+    assert "Failed to upload image to S3" in response.json()["detail"]
+
+
+def test_get_prediction_image_returns_503_when_s3_runtime_error(api_client, monkeypatch):
+    uid = create_prediction_with_mock(api_client, monkeypatch)
+    monkeypatch.setattr("app.download_file_from_s3", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("missing AWS config")))
+
+    response = api_client.get(f"/prediction/{uid}/image")
+
+    assert response.status_code == 503
+    assert "S3 configuration error" in response.json()["detail"]
+
+
+def test_get_prediction_image_returns_404_when_s3_download_fails(api_client, monkeypatch):
+    uid = create_prediction_with_mock(api_client, monkeypatch)
+    monkeypatch.setattr("app.download_file_from_s3", lambda *_args, **_kwargs: (_ for _ in ()).throw(Exception("not found")))
+
+    response = api_client.get(f"/prediction/{uid}/image")
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Image not found"
