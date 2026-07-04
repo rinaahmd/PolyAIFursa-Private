@@ -54,7 +54,7 @@ jobs:
               rinaahmd/agent-service:0.0.1
 
             docker run -d --name frontend \
-              -e NEXT_PUBLIC_AGENT_URL=http://host.docker.internal:8000 \
+              -e NEXT_PUBLIC_AGENT_URL=http://34.224.235.157:8000 \
               --add-host=host.docker.internal:host-gateway \
               -p 3000:3000 \
               rinaahmd/frontend-service:0.0.1
@@ -107,7 +107,7 @@ jobs:
               rinaahmd/agent-service:0.0.1
 
             docker run -d --name frontend \
-              -e NEXT_PUBLIC_AGENT_URL=http://host.docker.internal:8000 \
+              -e NEXT_PUBLIC_AGENT_URL=http://3.214.66.146:8000 \
               --add-host=host.docker.internal:host-gateway \
               -p 3000:3000 \
               rinaahmd/frontend-service:0.0.1
