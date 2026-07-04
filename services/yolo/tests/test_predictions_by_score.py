@@ -1,6 +1,7 @@
 import os
 import unittest
 import tempfile
+import uuid
 import numpy as np
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
@@ -43,14 +44,26 @@ class TestPredictionsByScore(unittest.TestCase):
 
     @patch("app.Image")
     @patch("app.model")
-    def test_get_predictions_by_score_returns_objects(self, mock_model, mock_image):
+    @patch("app.upload_file_to_s3")
+    @patch("app.download_file_from_s3")
+    def test_get_predictions_by_score_returns_objects(self, mock_download, _mock_upload, mock_model, mock_image):
         self._mock_yolo_with_objects(mock_model, mock_image)
 
-        with open(TEST_IMAGE, "rb") as f:
-            response = self.client.post(
-                "/predict",
-                files={"file": ("beatles.jpeg", f, "image/jpeg")}
-            )
+        def fake_download(_s3_key, local_path):
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(TEST_IMAGE, "rb") as src, open(local_path, "wb") as dst:
+                dst.write(src.read())
+
+        mock_download.side_effect = fake_download
+
+        prediction_id = str(uuid.uuid4())
+        response = self.client.post(
+            "/predict",
+            json={
+                "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+                "prediction_id": prediction_id,
+            },
+        )
 
         self.assertEqual(response.status_code, 200)
 

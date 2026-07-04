@@ -1,0 +1,78 @@
+services:
+  frontend:
+    build: ./services/frontend
+    ports:
+      - "3000:3000"
+    networks:
+      - polyai-net
+    depends_on:
+      - agent
+
+
+  agent:
+    build: ./services/agent
+    ports:
+      - "8000:8000"
+    environment:
+      - YOLO_SERVICE_URL=http://yolo:8080
+      - MODEL=amazon.nova-micro-v1:0
+      - AWS_REGION=us-east-1
+      - AWS_S3_BUCKET=rina-polyai-images
+      - AWS_PROFILE=default
+    volumes:
+      - ~/.aws:/root/.aws:ro
+    networks:
+      - polyai-net
+    depends_on:
+      - yolo
+
+
+
+
+  yolo:
+    build: ./services/yolo
+    ports:
+      - "8080:8080"
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_S3_BUCKET=rina-polyai-images
+      - AWS_PROFILE=default
+    volumes:
+      - ~/.aws:/root/.aws:ro
+    networks:
+      - polyai-net
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - monitoring-net
+      - polyai-net
+    depends_on:
+      - yolo
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - monitoring-net
+    depends_on:
+      - prometheus
+
+networks:
+  polyai-net:
+    driver: bridge
+
+  monitoring-net:
+    driver: bridge
+
+volumes:
+  grafana-data:
+  prometheus-data:
