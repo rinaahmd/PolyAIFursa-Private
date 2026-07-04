@@ -1,10 +1,6 @@
 services:
   frontend:
     image: rinaahmd/frontend-service:0.0.1
-    build:
-      context: ./services/frontend
-      args:
-        NEXT_PUBLIC_AGENT_URL: ${NEXT_PUBLIC_AGENT_URL:-http://localhost:8000}
     environment:
       - NEXT_PUBLIC_AGENT_URL=${NEXT_PUBLIC_AGENT_URL:-http://localhost:8000}
     ports:
@@ -17,7 +13,6 @@ services:
 
   agent:
     image: rinaahmd/agent-service:0.0.1
-    build: ./services/agent
     ports:
       - "8000:8000"
     environment:
@@ -38,7 +33,6 @@ services:
 
   yolo:
     image: rinaahmd/yolo-service:0.0.1
-    build: ./services/yolo
     ports:
       - "8080:8080"
     environment:
