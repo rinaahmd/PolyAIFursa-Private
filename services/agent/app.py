@@ -21,6 +21,7 @@ logging.basicConfig(
 )
 logging.getLogger("langchain").setLevel(logging.DEBUG)
 logging.getLogger("langchain_core").setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 import httpx
 from fastapi import FastAPI
@@ -64,6 +65,7 @@ def detect_objects() -> str:
     try:
         image_bytes = base64.b64decode(image_b64)
     except (binascii.Error, ValueError) as exc:
+        logger.exception("detect_objects: invalid base64 image encoding")
         return json.dumps({"error": f"Invalid image encoding: {exc}"})
 
     prediction_id = str(uuid.uuid4())
@@ -74,8 +76,10 @@ def detect_objects() -> str:
     try:
         _upload_bytes_to_s3(image_bytes, image_s3_key)
     except RuntimeError as exc:
+        logger.exception("detect_objects: S3 configuration error")
         return json.dumps({"error": f"S3 configuration error: {exc}"})
     except (BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError) as exc:
+        logger.exception("detect_objects: failed to upload image to S3")
         return json.dumps({"error": f"Failed to upload image to S3: {exc}"})
 
     try:
@@ -87,9 +91,11 @@ def detect_objects() -> str:
             response.raise_for_status()
         return json.dumps(response.json())
     except httpx.HTTPStatusError as exc:
+        logger.exception("detect_objects: YOLO service returned non-2xx status")
         detail = exc.response.text if exc.response is not None else str(exc)
         return json.dumps({"error": f"YOLO service returned an error: {detail}"})
     except httpx.HTTPError as exc:
+        logger.exception("detect_objects: failed HTTP call to YOLO service")
         return json.dumps({"error": f"Failed to call YOLO service: {exc}"})
 
 
