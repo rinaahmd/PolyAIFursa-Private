@@ -52,6 +52,7 @@ jobs:
             docker run -d --name agent \
               --env-file /home/ubuntu/PolyAIFursa-Private/services/agent/.env \
               --add-host=host.docker.internal:host-gateway \
+              -e YOLO_SERVICE_URL=http://host.docker.internal:8080 \
               -v /home/ubuntu/.aws:/root/.aws:ro \
               -e AWS_S3_BUCKET=rina-polyai-images \
               -p 8000:8000 \
@@ -124,6 +125,7 @@ jobs:
             docker run -d --name agent \
               --env-file /home/ubuntu/PolyAIFursa-Private/services/agent/.env \
               --add-host=host.docker.internal:host-gateway \
+              -e YOLO_SERVICE_URL=http://host.docker.internal:8080 \
               -v /home/ubuntu/.aws:/root/.aws:ro \
               -e AWS_S3_BUCKET=rina-polyai-images \
               -p 8000:8000 \

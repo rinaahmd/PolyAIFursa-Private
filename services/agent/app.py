@@ -32,7 +32,7 @@ from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.tools import tool
 from pydantic import BaseModel
 
-YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://localhost:8080")
+YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://yolo:8080")
 MODEL = os.environ.get("MODEL")
 AWS_REGION = os.environ.get("AWS_REGION")
 AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET")

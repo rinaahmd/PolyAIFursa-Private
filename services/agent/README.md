@@ -30,9 +30,12 @@ cp .env.example .env
 | `MODEL` | `amazon.nova-micro-v1:0` | Bedrock model passed to `init_chat_model` |
 | `AWS_REGION` | `us-east-1` | AWS region for Bedrock and S3 |
 | `AWS_S3_BUCKET` | - | S3 bucket for original and predicted images |
-| `YOLO_SERVICE_URL` | `http://localhost:8080` | URL of the YOLO microservice |
+| `YOLO_SERVICE_URL` | `http://host.docker.internal:8080` (docker run) or `http://yolo:8080` (Docker Compose) | URL of the YOLO microservice |
 
-Docker note (Linux): when agent runs in Docker and YOLO runs on host, use `YOLO_SERVICE_URL=http://host.docker.internal:8080` and run container with `--add-host=host.docker.internal:host-gateway`.
+Deployment notes:
+
+- Docker run on EC2/Linux host: use `YOLO_SERVICE_URL=http://host.docker.internal:8080` and run the agent container with `--add-host=host.docker.internal:host-gateway`.
+- Docker Compose: use `YOLO_SERVICE_URL=http://yolo:8080` so the agent reaches the `yolo` service by container name.
 
 ## Running
 

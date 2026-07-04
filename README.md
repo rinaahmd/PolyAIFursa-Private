@@ -37,6 +37,8 @@ docker run --rm --name agent \
 	rinaahmd/agent-service:0.0.1
 ```
 
+Ensure `services/agent/.env` sets `YOLO_SERVICE_URL=http://host.docker.internal:8080` for docker-run deployments.
+
 Frontend:
 
 ```bash
