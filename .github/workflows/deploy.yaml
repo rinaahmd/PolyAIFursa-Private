@@ -30,8 +30,12 @@ jobs:
             git checkout dev
             git pull origin dev
 
-            sudo systemctl restart docker
-            sudo systemctl status docker --no-pager
+            if systemctl list-unit-files | grep -q '^docker.service'; then
+              sudo systemctl restart docker
+              sudo systemctl status docker --no-pager
+            else
+              echo "docker.service not found, skipping Docker restart"
+            fi
 
             docker pull rinaahmd/yolo-service:0.0.1
             docker pull rinaahmd/agent-service:0.0.1
@@ -106,8 +110,12 @@ jobs:
             git checkout main
             git pull origin main
 
-            sudo systemctl restart docker
-            sudo systemctl status docker --no-pager
+            if systemctl list-unit-files | grep -q '^docker.service'; then
+              sudo systemctl restart docker
+              sudo systemctl status docker --no-pager
+            else
+              echo "docker.service not found, skipping Docker restart"
+            fi
 
             docker pull rinaahmd/yolo-service:0.0.1
             docker pull rinaahmd/agent-service:0.0.1
