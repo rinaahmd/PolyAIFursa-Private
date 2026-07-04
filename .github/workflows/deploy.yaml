@@ -18,16 +18,64 @@ jobs:
           username: ubuntu
           key: ${{ secrets.DEV_INSTANCE_SSH_KEY }}
           script: |
+            set -e
+
             cd /home/ubuntu/PolyAIFursa-Private
             git fetch origin
             git checkout dev
             git pull origin dev
-            cd services/yolo
-            source .venv/bin/activate
-            pip install -r torch-requirements.txt
-            pip install -r requirements.txt
-            sudo systemctl restart yolo
-            sudo systemctl status yolo --no-pager
+
+            sudo systemctl restart docker
+            sudo systemctl status docker --no-pager
+
+            docker pull rinaahmd/yolo-service:0.0.1
+            docker pull rinaahmd/agent-service:0.0.1
+            docker pull rinaahmd/frontend-service:0.0.1
+
+            docker rm -f frontend agent yolo || true
+
+            docker run -d --name yolo \
+              -v /home/ubuntu/.aws:/root/.aws:ro \
+              -e AWS_REGION=us-east-1 \
+              -e AWS_S3_BUCKET=rina-polyai-images \
+              -p 8080:8080 \
+              rinaahmd/yolo-service:0.0.1
+
+            docker run -d --name agent \
+              --env-file /home/ubuntu/PolyAIFursa-Private/services/agent/.env \
+              --add-host=host.docker.internal:host-gateway \
+              -v /home/ubuntu/.aws:/root/.aws:ro \
+              -p 8000:8000 \
+              rinaahmd/agent-service:0.0.1
+
+            docker run -d --name frontend \
+              -e NEXT_PUBLIC_AGENT_URL=http://host.docker.internal:8000 \
+              --add-host=host.docker.internal:host-gateway \
+              -p 3000:3000 \
+              rinaahmd/frontend-service:0.0.1
+
+            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+            wait_for_service() {
+              local url=$1
+              local name=$2
+              local max_attempts=30
+              for i in $(seq 1 $max_attempts); do
+                if curl -fsS "$url" > /dev/null 2>&1; then
+                  echo "$name is healthy"
+                  return 0
+                fi
+                echo "Waiting for $name... (attempt $i/$max_attempts)"
+                sleep 3
+              done
+              echo "ERROR: $name did not become healthy in time"
+              docker logs "$name" --tail 50
+              return 1
+            }
+
+            wait_for_service http://localhost:8080/health yolo
+            wait_for_service http://localhost:8000/health agent
+            wait_for_service http://localhost:3000 frontend
 
   deploy-prod:
     if: github.ref == 'refs/heads/main'
