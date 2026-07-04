@@ -59,7 +59,7 @@ jobs:
             wait_for_service() {
               local url=$1
               local name=$2
-              local max_attempts=30
+              local max_attempts=${3:-30}
               for i in $(seq 1 $max_attempts); do
                 if curl -fsS "$url" > /dev/null 2>&1; then
                   echo "$name is healthy"
@@ -73,9 +73,10 @@ jobs:
               return 1
             }
 
-            wait_for_service http://localhost:8080/health yolo
-            wait_for_service http://localhost:8000/health agent
-            wait_for_service http://localhost:3000 frontend
+            # yolo needs more time to load the AI model
+            wait_for_service http://localhost:8080/health yolo 40 || exit 1
+            wait_for_service http://localhost:8000/health agent 30 || exit 1
+            wait_for_service http://localhost:3000 frontend 20 || exit 1
 
   deploy-prod:
     if: github.ref == 'refs/heads/main'
