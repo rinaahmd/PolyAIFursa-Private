@@ -38,10 +38,10 @@ jobs:
             fi
 
             export NEXT_PUBLIC_AGENT_URL=http://34.224.235.157:8000
-            docker compose pull frontend agent yolo
-            docker compose down
-            docker compose up -d --build frontend agent yolo
-            docker compose ps
+            docker compose -f docker-compose.yml pull frontend agent yolo && \
+            docker compose -f docker-compose.yml down && \
+            docker compose -f docker-compose.yml up -d frontend agent yolo
+            docker compose -f docker-compose.yml ps
 
             wait_for_service() {
               local name="$1"
@@ -92,10 +92,10 @@ jobs:
             fi
 
             export NEXT_PUBLIC_AGENT_URL=http://3.214.66.146:8000
-            docker compose pull frontend agent yolo
-            docker compose down
-            docker compose up -d --build frontend agent yolo
-            docker compose ps
+            docker compose -f docker-compose.yml pull frontend agent yolo && \
+            docker compose -f docker-compose.yml down && \
+            docker compose -f docker-compose.yml up -d frontend agent yolo
+            docker compose -f docker-compose.yml ps
 
             wait_for_service() {
               local name="$1"
