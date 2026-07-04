@@ -53,6 +53,7 @@ jobs:
               --env-file /home/ubuntu/PolyAIFursa-Private/services/agent/.env \
               --add-host=host.docker.internal:host-gateway \
               -v /home/ubuntu/.aws:/root/.aws:ro \
+              -e AWS_S3_BUCKET=rina-polyai-images \
               -p 8000:8000 \
               rinaahmd/agent-service:0.0.1
 
@@ -124,6 +125,7 @@ jobs:
               --env-file /home/ubuntu/PolyAIFursa-Private/services/agent/.env \
               --add-host=host.docker.internal:host-gateway \
               -v /home/ubuntu/.aws:/root/.aws:ro \
+              -e AWS_S3_BUCKET=rina-polyai-images \
               -p 8000:8000 \
               rinaahmd/agent-service:0.0.1
 
