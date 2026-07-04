@@ -35,7 +35,10 @@ jobs:
 
             docker pull rinaahmd/yolo-service:0.0.1
             docker pull rinaahmd/agent-service:0.0.1
-            docker pull rinaahmd/frontend-service:0.0.1
+
+            docker build -t frontend-service:dev \
+              --build-arg NEXT_PUBLIC_AGENT_URL=http://34.224.235.157:8000 \
+              /home/ubuntu/PolyAIFursa-Private/services/frontend
 
             docker rm -f frontend agent yolo || true
 
@@ -54,10 +57,9 @@ jobs:
               rinaahmd/agent-service:0.0.1
 
             docker run -d --name frontend \
-              -e NEXT_PUBLIC_AGENT_URL=http://34.224.235.157:8000 \
               --add-host=host.docker.internal:host-gateway \
               -p 3000:3000 \
-              rinaahmd/frontend-service:0.0.1
+              frontend-service:dev
 
             docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 
