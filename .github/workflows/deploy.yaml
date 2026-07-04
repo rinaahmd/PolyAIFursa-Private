@@ -61,9 +61,28 @@ jobs:
 
             docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 
-            curl -fsS http://localhost:8080/health
-            curl -fsS http://localhost:8000/health
-            curl -fsSI http://localhost:3000
+            wait_for_service() {
+              local name="$1"
+              local url="$2"
+              local max_retries=60
+              local retries=0
+
+              until curl -fsS "$url" > /dev/null; do
+                retries=$((retries + 1))
+                if [ "$retries" -ge "$max_retries" ]; then
+                  echo "Service '$name' failed to become ready within 60 seconds: $url"
+                  return 1
+                fi
+                echo "Waiting for '$name' to be ready... ($retries/$max_retries)"
+                sleep 1
+              done
+
+              echo "Service '$name' is ready: $url"
+            }
+
+            wait_for_service "yolo" "http://localhost:8080/health"
+            wait_for_service "agent" "http://localhost:8000/health"
+            wait_for_service "frontend" "http://localhost:3000"
 
   deploy-prod:
     if: github.ref == 'refs/heads/main'
@@ -114,6 +133,25 @@ jobs:
 
             docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 
-            curl -fsS http://localhost:8080/health
-            curl -fsS http://localhost:8000/health
-            curl -fsSI http://localhost:3000
+            wait_for_service() {
+              local name="$1"
+              local url="$2"
+              local max_retries=60
+              local retries=0
+
+              until curl -fsS "$url" > /dev/null; do
+                retries=$((retries + 1))
+                if [ "$retries" -ge "$max_retries" ]; then
+                  echo "Service '$name' failed to become ready within 60 seconds: $url"
+                  return 1
+                fi
+                echo "Waiting for '$name' to be ready... ($retries/$max_retries)"
+                sleep 1
+              done
+
+              echo "Service '$name' is ready: $url"
+            }
+
+            wait_for_service "yolo" "http://localhost:8080/health"
+            wait_for_service "agent" "http://localhost:8000/health"
+            wait_for_service "frontend" "http://localhost:3000"
