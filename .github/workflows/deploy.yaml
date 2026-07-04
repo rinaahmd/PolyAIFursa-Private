@@ -1,10 +1,15 @@
-name: Deploy Yolo
+name: Deploy Services
 
 on:
   push:
     branches:
       - main
       - dev
+
+
+
+permissions:
+  contents: read
 
 jobs:
   deploy-dev:
@@ -18,16 +23,70 @@ jobs:
           username: ubuntu
           key: ${{ secrets.DEV_INSTANCE_SSH_KEY }}
           script: |
+            set -e
+
             cd /home/ubuntu/PolyAIFursa-Private
             git fetch origin
             git checkout dev
             git pull origin dev
-            cd services/yolo
-            source .venv/bin/activate
-            pip install -r torch-requirements.txt
-            pip install -r requirements.txt
-            sudo systemctl restart yolo
-            sudo systemctl status yolo --no-pager
+
+            sudo systemctl restart docker
+            sudo systemctl status docker --no-pager
+
+            docker pull rinaahmd/yolo-service:0.0.1
+            docker pull rinaahmd/agent-service:0.0.1
+
+            docker build -t frontend-service:dev \
+              --build-arg NEXT_PUBLIC_AGENT_URL=http://34.224.235.157:8000 \
+              /home/ubuntu/PolyAIFursa-Private/services/frontend
+
+            docker rm -f frontend agent yolo || true
+
+            docker run -d --name yolo \
+              -v /home/ubuntu/.aws:/root/.aws:ro \
+              -e AWS_REGION=us-east-1 \
+              -e AWS_S3_BUCKET=rina-polyai-images \
+              -p 8080:8080 \
+              rinaahmd/yolo-service:0.0.1
+
+            docker run -d --name agent \
+              --env-file /home/ubuntu/PolyAIFursa-Private/services/agent/.env \
+              --add-host=host.docker.internal:host-gateway \
+              -e YOLO_SERVICE_URL=http://host.docker.internal:8080 \
+              -v /home/ubuntu/.aws:/root/.aws:ro \
+              -e AWS_S3_BUCKET=rina-polyai-images \
+              -p 8000:8000 \
+              rinaahmd/agent-service:0.0.1
+
+            docker run -d --name frontend \
+              --add-host=host.docker.internal:host-gateway \
+              -p 3000:3000 \
+              frontend-service:dev
+
+            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+            wait_for_service() {
+              local name="$1"
+              local url="$2"
+              local max_retries=60
+              local retries=0
+
+              until curl -fsS "$url" > /dev/null; do
+                retries=$((retries + 1))
+                if [ "$retries" -ge "$max_retries" ]; then
+                  echo "Service '$name' failed to become ready within 60 seconds: $url"
+                  return 1
+                fi
+                echo "Waiting for '$name' to be ready... ($retries/$max_retries)"
+                sleep 1
+              done
+
+              echo "Service '$name' is ready: $url"
+            }
+
+            wait_for_service "yolo" "http://localhost:8080/health"
+            wait_for_service "agent" "http://localhost:8000/health"
+            wait_for_service "frontend" "http://localhost:3000"
 
   deploy-prod:
     if: github.ref == 'refs/heads/main'
@@ -40,13 +99,65 @@ jobs:
           username: ubuntu
           key: ${{ secrets.PROD_INSTANCE_SSH_KEY }}
           script: |
+            set -e
+
             cd /home/ubuntu/PolyAIFursa-Private
             git fetch origin
             git checkout main
             git pull origin main
-            cd services/yolo
-            source .venv/bin/activate
-            pip install -r torch-requirements.txt
-            pip install -r requirements.txt
-            sudo systemctl restart yolo
-            sudo systemctl status yolo --no-pager
+
+            sudo systemctl restart docker
+            sudo systemctl status docker --no-pager
+
+            docker pull rinaahmd/yolo-service:0.0.1
+            docker pull rinaahmd/agent-service:0.0.1
+            docker pull rinaahmd/frontend-service:0.0.1
+
+            docker rm -f frontend agent yolo || true
+
+            docker run -d --name yolo \
+              -v /home/ubuntu/.aws:/root/.aws:ro \
+              -e AWS_REGION=us-east-1 \
+              -e AWS_S3_BUCKET=rina-polyai-images \
+              -p 8080:8080 \
+              rinaahmd/yolo-service:0.0.1
+
+            docker run -d --name agent \
+              --env-file /home/ubuntu/PolyAIFursa-Private/services/agent/.env \
+              --add-host=host.docker.internal:host-gateway \
+              -e YOLO_SERVICE_URL=http://host.docker.internal:8080 \
+              -v /home/ubuntu/.aws:/root/.aws:ro \
+              -e AWS_S3_BUCKET=rina-polyai-images \
+              -p 8000:8000 \
+              rinaahmd/agent-service:0.0.1
+
+            docker run -d --name frontend \
+              -e NEXT_PUBLIC_AGENT_URL=http://3.214.66.146:8000 \
+              --add-host=host.docker.internal:host-gateway \
+              -p 3000:3000 \
+              rinaahmd/frontend-service:0.0.1
+
+            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+            wait_for_service() {
+              local name="$1"
+              local url="$2"
+              local max_retries=60
+              local retries=0
+
+              until curl -fsS "$url" > /dev/null; do
+                retries=$((retries + 1))
+                if [ "$retries" -ge "$max_retries" ]; then
+                  echo "Service '$name' failed to become ready within 60 seconds: $url"
+                  return 1
+                fi
+                echo "Waiting for '$name' to be ready... ($retries/$max_retries)"
+                sleep 1
+              done
+
+              echo "Service '$name' is ready: $url"
+            }
+
+            wait_for_service "yolo" "http://localhost:8080/health"
+            wait_for_service "agent" "http://localhost:8000/health"
+            wait_for_service "frontend" "http://localhost:3000"

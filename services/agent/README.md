@@ -20,18 +20,22 @@ Configure environment:
 
 ```bash
 cp .env.example .env
-# Edit .env and set at least OPENAI_API_KEY (or another provider key) and MODEL
+# Edit .env and set MODEL, AWS_REGION, AWS_S3_BUCKET, and YOLO_SERVICE_URL
 ```
 
 `.env` variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | - | Required for OpenAI models |
-| `ANTHROPIC_API_KEY` | - | Required for Anthropic models |
-| `GOOGLE_API_KEY` | - | Required for Google models |
-| `MODEL` | `claude-sonnet-4-6` | Any model string supported by `init_chat_model` |
-| `YOLO_SERVICE_URL` | `http://localhost:8080` | URL of the YOLO microservice |
+| `MODEL` | `amazon.nova-micro-v1:0` | Bedrock model passed to `init_chat_model` |
+| `AWS_REGION` | `us-east-1` | AWS region for Bedrock and S3 |
+| `AWS_S3_BUCKET` | - | S3 bucket for original and predicted images |
+| `YOLO_SERVICE_URL` | `http://host.docker.internal:8080` (docker run) or `http://yolo:8080` (Docker Compose) | URL of the YOLO microservice |
+
+Deployment notes:
+
+- Docker run on EC2/Linux host: use `YOLO_SERVICE_URL=http://host.docker.internal:8080` and run the agent container with `--add-host=host.docker.internal:host-gateway`.
+- Docker Compose: use `YOLO_SERVICE_URL=http://yolo:8080` so the agent reaches the `yolo` service by container name.
 
 ## Running
 
@@ -60,13 +64,13 @@ Expected response:
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -d '{"message": "Hello! What can you do?"}'
+  -d '{"messages": [{"role": "user", "content": "Hello! What can you do?"}], "chat_id": "demo-chat"}'
 ```
 
 ### Send a message with an image
 
 ```bash
-echo "{\"message\": \"What objects are in this image?\", \"image_base64\": \"$(base64 -w0 beatles.jpeg)\"}" \
+echo "{\"messages\":[{\"role\":\"user\",\"content\":\"What objects are in this image?\",\"image_base64\":\"$(base64 -w0 beatles.jpeg)\"}],\"chat_id\":\"demo-chat\"}" \
   | curl -X POST http://localhost:8000/chat \
          -H "Content-Type: application/json" \
          -d @-
@@ -80,8 +84,14 @@ Request body:
 
 ```json
 {
-  "message": "string (optional, defaults to 'What's in this image?')",
-  "image_base64": "string (optional, base64-encoded JPEG or PNG)"
+  "messages": [
+    {
+      "role": "user | assistant",
+      "content": "string",
+      "image_base64": "optional base64-encoded image for user messages"
+    }
+  ],
+  "chat_id": "optional string"
 }
 ```
 
@@ -89,7 +99,18 @@ Response:
 
 ```json
 {
-  "response": "string"
+  "response": "string",
+  "prediction_id": "string | null",
+  "annotated_image": "string | null",
+  "agent_loop_time_s": 0.0,
+  "iterations": 1,
+  "tools_called": [],
+  "context_limit_exceeded": false,
+  "tokens_used": {
+    "input": null,
+    "output": null,
+    "total": null
+  }
 }
 ```
 

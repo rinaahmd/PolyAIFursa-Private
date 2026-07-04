@@ -1,0 +1,8 @@
+node_modules/
+.next/
+coverage/
+.git
+.gitignore
+.env.local
+.env.*.local
+npm-debug.log*
