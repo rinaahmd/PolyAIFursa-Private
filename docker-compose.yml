@@ -3,10 +3,10 @@ services:
     build:
       context: ./services/frontend
       args:
-        NEXT_PUBLIC_AGENT_URL: http://3.214.66.146:8000
+        NEXT_PUBLIC_AGENT_URL: ${NEXT_PUBLIC_AGENT_URL:-http://localhost:8000}
     image: rinaahmd/frontend-service:0.0.2
     environment:
-      - NEXT_PUBLIC_AGENT_URL=http://3.214.66.146:8000
+      - NEXT_PUBLIC_AGENT_URL=${NEXT_PUBLIC_AGENT_URL:-http://localhost:8000}
     ports:
       - "3000:3000"
     networks:
