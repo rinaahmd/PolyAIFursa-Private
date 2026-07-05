@@ -23,7 +23,6 @@ services:
       - MODEL=amazon.nova-micro-v1:0
       - AWS_REGION=us-east-1
       - AWS_S3_BUCKET=rina-polyai-images
-      - AWS_PROFILE=default
     volumes:
       - ~/.aws:/root/.aws:ro
     networks:
@@ -41,7 +40,6 @@ services:
     environment:
       - AWS_REGION=us-east-1
       - AWS_S3_BUCKET=rina-polyai-images
-      - AWS_PROFILE=default
     volumes:
       - ~/.aws:/root/.aws:ro
     networks:
