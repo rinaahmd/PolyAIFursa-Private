@@ -28,7 +28,7 @@ jobs:
             cd /home/ubuntu/PolyAIFursa-Private
             git fetch origin
             git checkout dev
-            git pull origin dev
+            git reset --hard origin/dev
 
             if systemctl list-unit-files | grep -q '^docker.service'; then
               sudo systemctl restart docker
@@ -38,8 +38,9 @@ jobs:
             fi
 
             export NEXT_PUBLIC_AGENT_URL=http://34.224.235.157:8000
-            docker compose -f docker-compose.yml pull frontend agent yolo && \
+            docker compose -f docker-compose.yml pull agent yolo && \
             docker compose -f docker-compose.yml down && \
+            docker compose -f docker-compose.yml build --no-cache frontend && \
             docker compose -f docker-compose.yml up -d frontend agent yolo
             docker compose -f docker-compose.yml ps
 
@@ -82,7 +83,7 @@ jobs:
             cd /home/ubuntu/PolyAIFursa-Private
             git fetch origin
             git checkout main
-            git pull origin main
+            git reset --hard origin/main
 
             if systemctl list-unit-files | grep -q '^docker.service'; then
               sudo systemctl restart docker
@@ -92,8 +93,9 @@ jobs:
             fi
 
             export NEXT_PUBLIC_AGENT_URL=http://3.214.66.146:8000
-            docker compose -f docker-compose.yml pull frontend agent yolo && \
+            docker compose -f docker-compose.yml pull agent yolo && \
             docker compose -f docker-compose.yml down && \
+            docker compose -f docker-compose.yml build --no-cache frontend && \
             docker compose -f docker-compose.yml up -d frontend agent yolo
             docker compose -f docker-compose.yml ps
 
