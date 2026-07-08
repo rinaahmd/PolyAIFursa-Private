@@ -52,8 +52,11 @@ SYSTEM_PROMPT = (
     "whenever the request is about 'the image'/'this image'/'the whole image'. "
     "blur_object/rotate_object/flip_object/add_noise_object affect just ONE detected object - "
     "use these only when the user names a specific object (e.g. 'the second dog', 'the detected "
-    "car'): call detect_objects first, find the matching entry in its \"detections\" list, and "
-    "pass its \"index\" as object_index. "
+    "car'): call detect_objects first, then pass the object's label plus rank_from_left or "
+    "rank_from_right copied directly from the user's wording (e.g. 'the second dog from the "
+    "right' -> label='dog', rank_from_right=2). Never try to pick the object_index yourself by "
+    "comparing box coordinates or ranks across a list - that reasoning is unreliable; let the "
+    "rank_from_left/rank_from_right parameters do it. "
     "Edits build on each other: if the user already blurred the image and now asks to rotate it, "
     "rotate the blurred version - each new edit applies to the current state of the image, not "
     "back to the original upload."
@@ -74,6 +77,14 @@ def _normalized_chat_id() -> str:
 # so a write from inside one tool call would never be visible to the next one in
 # the same turn. Reset (popped) whenever chat() sees a genuinely new upload.
 _current_working_image: dict[str, str] = {}
+
+# Set by chat() from _parse_ordinal_object_reference on the current user
+# message. blur_object/rotate_object/flip_object/add_noise_object use this to
+# OVERRIDE whatever label/rank_from_left/rank_from_right the model passed -
+# even after being told to just copy these values, the model has been
+# observed to still substitute the wrong number most of the time, so the
+# parsed reference is treated as ground truth rather than a suggestion.
+_object_reference_hint_by_chat: dict[str, dict] = {}
 
 
 def _get_current_image() -> Optional[str]:
@@ -114,7 +125,27 @@ def _fetch_detections(prediction_id: str) -> list[dict]:
         except (json.JSONDecodeError, TypeError, KeyError):
             continue
         detections.append({"index": index, "label": obj.get("label"), "score": obj.get("score"), "box": box})
+
+    _add_left_right_rank(detections)
     return detections
+
+
+def _add_left_right_rank(detections: list[dict]) -> None:
+    """Add rank_from_left/rank_from_right (1-based) to each detection, ranked
+    among objects sharing the same label, ordered by horizontal center. Doing
+    this comparison in code - rather than asking the LLM to compare several
+    raw box coordinates by itself - is what makes "the second dog from the
+    right" resolve reliably instead of depending on the model's arithmetic."""
+    by_label: dict[str, list[dict]] = {}
+    for detection in detections:
+        by_label.setdefault(detection["label"], []).append(detection)
+
+    for same_label_detections in by_label.values():
+        same_label_detections.sort(key=lambda d: (d["box"][0] + d["box"][2]) / 2)
+        count = len(same_label_detections)
+        for rank, detection in enumerate(same_label_detections, start=1):
+            detection["rank_from_left"] = rank
+            detection["rank_from_right"] = count - rank + 1
 
 
 @tool
@@ -122,11 +153,13 @@ def detect_objects() -> str:
     """Detect and identify objects in the image provided by the user using YOLO object detection.
 
     The result includes a "detections" list, each with an "index", "label",
-    "score", and "box" ([left, top, right, bottom] in pixels). To edit one
-    specific object (e.g. "blur the second dog from the right"), first look
-    at the boxes here to figure out which index that is (e.g. compare the
-    left/right x-coordinates of every "dog" entry), then pass that index as
-    object_index to blur_object/rotate_object/flip_object/add_noise_object.
+    "score", "box" ([left, top, right, bottom] in pixels), "rank_from_left",
+    and "rank_from_right" (1-based, computed among objects sharing the same
+    label). You do not need to read or compare these rank values yourself -
+    to edit a specific object (e.g. "the second dog from the right"), call
+    blur_object/rotate_object/flip_object/add_noise_object directly with
+    label="dog" and rank_from_right=2, copied straight from the user's
+    wording. Do not try to resolve this to an index yourself.
     """
     image_b64 = _get_current_image()
     if not image_b64:
@@ -226,20 +259,55 @@ async def _call_mcp_object_op(operation: str, arguments: dict, image_b64: str, b
     )
 
 
-def _run_image_op(operation: str, arguments: dict, object_index: int | None = None) -> str:
+def _resolve_object_box(label: str, rank_from_left: int | None, rank_from_right: int | None) -> tuple[list | None, str | None]:
+    """Resolve (label, rank) to a box, entirely in code. We deliberately do NOT
+    ask the LLM to compare box coordinates or pick a raw index itself - even
+    when handed pre-computed rank_from_left/rank_from_right values, this small
+    model has been observed to state the correct rank in its own reasoning and
+    then still pick the wrong object. Reducing its job to "translate the
+    phrase 'second from the right' into rank_from_right=2" - a literal
+    wording-to-number copy, not a comparison across a list - is reliable."""
+    chat_id = _normalized_chat_id()
+    candidates = [d for d in _detections_by_chat.get(chat_id, []) if d["label"] == label]
+    if not candidates:
+        return None, f"No detected object labeled '{label}'. Call detect_objects first."
+
+    rank = rank_from_left if rank_from_left is not None else (rank_from_right or 1)
+    rank_field = "rank_from_left" if rank_from_left is not None else "rank_from_right"
+    match = next((d for d in candidates if d[rank_field] == rank), None)
+    if match is None:
+        return None, f"No '{label}' with {rank_field}={rank}. There are only {len(candidates)}."
+    return match["box"], None
+
+
+def _run_image_op(
+    operation: str,
+    arguments: dict,
+    label: str | None = None,
+    rank_from_left: int | None = None,
+    rank_from_right: int | None = None,
+) -> str:
     chat_id = _normalized_chat_id()
     image_b64 = _get_current_image()
     if not image_b64:
         return json.dumps({"error": "No image was provided by the user."})
 
+    if label is not None:
+        # chat() already parsed the user's actual wording into a hint with
+        # plain Python - that's ground truth. Override whatever the model
+        # passed rather than trust it, since the model has been observed to
+        # still get the number wrong even when told to just copy the hint.
+        hint = _object_reference_hint_by_chat.get(chat_id)
+        if hint is not None:
+            label = hint["label"]
+            rank_from_left = hint["rank_from_left"]
+            rank_from_right = hint["rank_from_right"]
+
     box = None
-    if object_index is not None:
-        detections = _detections_by_chat.get(chat_id, [])
-        box = next((d["box"] for d in detections if d["index"] == object_index), None)
-        if box is None:
-            return json.dumps(
-                {"error": f"No detected object with index {object_index}. Call detect_objects first."}
-            )
+    if label is not None:
+        box, error = _resolve_object_box(label, rank_from_left, rank_from_right)
+        if error:
+            return json.dumps({"error": error})
 
     try:
         if box is None:
@@ -254,8 +322,8 @@ def _run_image_op(operation: str, arguments: dict, object_index: int | None = No
     operation_id = str(uuid.uuid4())
     _processed_images[operation_id] = result_b64
     result = {"status": "ok", "operation": operation, "operation_id": operation_id, **arguments}
-    if object_index is not None:
-        result["object_index"] = object_index
+    if label is not None:
+        result["label"] = label
     return json.dumps(result)
 
 
@@ -276,17 +344,23 @@ def blur_image(radius: float = 2.0) -> str:
 
 
 @tool
-def blur_object(object_index: int, radius: float = 2.0) -> str:
+def blur_object(label: str, rank_from_left: int | None = None, rank_from_right: int | None = None, radius: float = 2.0) -> str:
     """Apply a Gaussian blur to just one detected object in the image.
 
-    Call detect_objects first, find the matching entry in its "detections"
-    list (e.g. "the second dog"), and pass its "index" as object_index here.
+    Call detect_objects first. Do not pick an index yourself - just copy the
+    label and position wording directly from the user's request.
 
     Args:
-        object_index: The "index" of the target object from detect_objects's "detections" list.
+        label: The object's label exactly as detect_objects reported it (e.g. "dog", "car").
+        rank_from_left: Position counting from the left, 1-based (e.g. "the first dog" -> 1).
+        rank_from_right: Position counting from the right, 1-based (e.g. "the second dog from the right" -> 2).
+            Set exactly one of rank_from_left/rank_from_right, matching the user's wording. If the
+            user just says "the dog"/"the detected car" with no position, leave both unset.
         radius: Blur strength in pixels, same scale as blur_image.
     """
-    return _run_image_op("blur", {"radius": radius}, object_index=object_index)
+    return _run_image_op(
+        "blur", {"radius": radius}, label=label, rank_from_left=rank_from_left, rank_from_right=rank_from_right
+    )
 
 
 @tool
@@ -304,19 +378,28 @@ def rotate_image(angle: float) -> str:
 
 
 @tool
-def rotate_object(object_index: int, angle: float) -> str:
-    """Rotate just one detected object in the image counter-clockwise.
+def rotate_object(label: str, angle: float, rank_from_left: int | None = None, rank_from_right: int | None = None) -> str:
+    """Rotate just one detected object in the image counter-clockwise. The object keeps its
+    original size (corners of the rotated content get clipped) so it can be placed back.
 
-    Call detect_objects first, find the matching entry in its "detections"
-    list, and pass its "index" as object_index here. The object keeps its
-    original size (corners of the rotated content get clipped) so it can be
-    placed back into the image.
+    Call detect_objects first. Do not pick an index yourself - just copy the
+    label and position wording directly from the user's request.
 
     Args:
-        object_index: The "index" of the target object from detect_objects's "detections" list.
+        label: The object's label exactly as detect_objects reported it (e.g. "dog", "car").
         angle: Rotation angle in degrees, e.g. 90 for a quarter turn.
+        rank_from_left: Position counting from the left, 1-based (e.g. "the first dog" -> 1).
+        rank_from_right: Position counting from the right, 1-based (e.g. "the second dog from the right" -> 2).
+            Set exactly one of rank_from_left/rank_from_right, matching the user's wording. If the
+            user just says "the dog"/"the detected car" with no position, leave both unset.
     """
-    return _run_image_op("rotate", {"angle": angle, "expand": False}, object_index=object_index)
+    return _run_image_op(
+        "rotate",
+        {"angle": angle, "expand": False},
+        label=label,
+        rank_from_left=rank_from_left,
+        rank_from_right=rank_from_right,
+    )
 
 
 @tool
@@ -334,17 +417,23 @@ def flip_image(direction: str = "horizontal") -> str:
 
 
 @tool
-def flip_object(object_index: int, direction: str = "horizontal") -> str:
+def flip_object(label: str, direction: str = "horizontal", rank_from_left: int | None = None, rank_from_right: int | None = None) -> str:
     """Flip just one detected object in the image.
 
-    Call detect_objects first, find the matching entry in its "detections"
-    list, and pass its "index" as object_index here.
+    Call detect_objects first. Do not pick an index yourself - just copy the
+    label and position wording directly from the user's request.
 
     Args:
-        object_index: The "index" of the target object from detect_objects's "detections" list.
+        label: The object's label exactly as detect_objects reported it (e.g. "dog", "car").
         direction: 'horizontal' to mirror left-right, or 'vertical' to flip upside down.
+        rank_from_left: Position counting from the left, 1-based (e.g. "the first dog" -> 1).
+        rank_from_right: Position counting from the right, 1-based (e.g. "the second dog from the right" -> 2).
+            Set exactly one of rank_from_left/rank_from_right, matching the user's wording. If the
+            user just says "the dog"/"the detected car" with no position, leave both unset.
     """
-    return _run_image_op("flip", {"direction": direction}, object_index=object_index)
+    return _run_image_op(
+        "flip", {"direction": direction}, label=label, rank_from_left=rank_from_left, rank_from_right=rank_from_right
+    )
 
 
 @tool
@@ -386,17 +475,23 @@ def add_noise_image(amount: float = 0.05) -> str:
 
 
 @tool
-def add_noise_object(object_index: int, amount: float = 0.05) -> str:
+def add_noise_object(label: str, amount: float = 0.05, rank_from_left: int | None = None, rank_from_right: int | None = None) -> str:
     """Add salt-and-pepper noise to just one detected object in the image.
 
-    Call detect_objects first, find the matching entry in its "detections"
-    list, and pass its "index" as object_index here.
+    Call detect_objects first. Do not pick an index yourself - just copy the
+    label and position wording directly from the user's request.
 
     Args:
-        object_index: The "index" of the target object from detect_objects's "detections" list.
+        label: The object's label exactly as detect_objects reported it (e.g. "dog", "car").
         amount: Fraction of pixels to affect, between 0 and 1 (e.g. 0.05 = 5% of pixels).
+        rank_from_left: Position counting from the left, 1-based (e.g. "the first dog" -> 1).
+        rank_from_right: Position counting from the right, 1-based (e.g. "the second dog from the right" -> 2).
+            Set exactly one of rank_from_left/rank_from_right, matching the user's wording. If the
+            user just says "the dog"/"the detected car" with no position, leave both unset.
     """
-    return _run_image_op("add_noise", {"amount": amount}, object_index=object_index)
+    return _run_image_op(
+        "add_noise", {"amount": amount}, label=label, rank_from_left=rank_from_left, rank_from_right=rank_from_right
+    )
 
 
 # Registry: map tool name -> tool function
@@ -601,6 +696,9 @@ def _content_item_text(item: Any) -> str:
 
 def _sanitize_response_text(text: str) -> str:
     cleaned = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # The model sometimes wraps its final answer in a literal <response> tag
+    # instead of just returning plain text - keep the text, drop the tags.
+    cleaned = re.sub(r"</?response>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"!\[[^\]]*\]\(data:image/[^)]+\)", "", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -794,6 +892,50 @@ class ChatResponse(BaseModel):
 # the original image is still recovered below by scanning the FULL history.
 MAX_HISTORY_MESSAGES = 4
 
+_ORDINAL_WORDS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+}
+_ORDINAL_REFERENCE_PATTERN = re.compile(
+    r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+"
+    r"(?:detected\s+)?([a-zA-Z]+)",
+    re.IGNORECASE,
+)
+_DIRECTION_PATTERN = re.compile(r"from\s+the\s+(left|right)", re.IGNORECASE)
+
+
+def _parse_ordinal_object_reference(text: str) -> Optional[dict]:
+    """Best-effort parse of phrases like 'the second dog (from the right)' into
+    a {label, rank_from_left, rank_from_right} hint. This exists because the
+    small tool-calling model has been observed to mistranslate even a plain
+    ordinal word like "second" into the wrong integer on most attempts -
+    handing it a pre-computed hint to copy is far more reliable than asking
+    it to work the number out itself."""
+    match = _ORDINAL_REFERENCE_PATTERN.search(text)
+    if not match:
+        return None
+
+    ordinal_text, label = match.groups()
+    rank = _ORDINAL_WORDS.get(ordinal_text.lower())
+    if rank is None:
+        digits = re.match(r"\d+", ordinal_text)
+        if not digits:
+            return None
+        rank = int(digits.group())
+
+    direction_match = _DIRECTION_PATTERN.search(text)
+    direction = direction_match.group(1).lower() if direction_match else "left"
+
+    label = label.lower().rstrip(".,!?")
+    if label.endswith("s") and len(label) > 3:
+        label = label[:-1]  # naive singularization, e.g. "dogs" -> "dog"
+
+    return {
+        "label": label,
+        "rank_from_left": rank if direction == "left" else None,
+        "rank_from_right": rank if direction == "right" else None,
+    }
+
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
@@ -809,6 +951,15 @@ def chat(request: ChatRequest):
         # instead of continuing to build on whatever was edited before it.
         _current_working_image.pop(normalized_chat_id, None)
 
+    parsed_hint = None
+    if newest_message is not None and newest_message.role == "user":
+        parsed_hint = _parse_ordinal_object_reference(newest_message.content)
+    if parsed_hint is not None:
+        _object_reference_hint_by_chat[normalized_chat_id] = parsed_hint
+    else:
+        # Don't let a hint from an earlier, unrelated turn leak into this one.
+        _object_reference_hint_by_chat.pop(normalized_chat_id, None)
+
     recent_messages = request.messages[-MAX_HISTORY_MESSAGES:]
     while recent_messages and recent_messages[0].role != "user":
         recent_messages = recent_messages[1:]  # Bedrock requires the first message to be from the user
@@ -821,6 +972,11 @@ def chat(request: ChatRequest):
             else:
                 reminder = "\n[Use the available tools to fulfill this request - do not claim to have performed an action without actually calling the matching tool.]"
             content = msg.content + reminder
+            if msg is newest_message and parsed_hint is not None:
+                content += (
+                    f"\n[Parsed object reference: label={parsed_hint['label']!r}, "
+                    f"rank_from_left={parsed_hint['rank_from_left']!r}, rank_from_right={parsed_hint['rank_from_right']!r}.]"
+                )
             lc_messages.append(HumanMessage(content=content))
         else:
             lc_messages.append(AIMessage(content=msg.content))
