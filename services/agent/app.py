@@ -41,15 +41,49 @@ AWS_REGION = os.environ.get("AWS_REGION")
 AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET")
 
 SYSTEM_PROMPT = (
-    "You are an AI vision assistant. You help users understand and analyze images. "
-    "Use the available tools to extract information from images. "
+    "You are an AI vision assistant. You help users understand, analyze, and transform images. "
+    "Use the available tools to extract information from images or to apply requested edits "
+    "(blur, rotate, flip, resize, crop, add noise, etc.). "
+    "You must call the matching tool for every such request - never claim you performed an "
+    "operation without actually calling the tool for it, even if a similar request was handled "
+    "earlier in the conversation. "
+    "There are two families of edit tools: blur_image/rotate_image/flip_image/add_noise_image "
+    "affect the WHOLE image - use these directly, with no need to call detect_objects first, "
+    "whenever the request is about 'the image'/'this image'/'the whole image'. "
+    "blur_object/rotate_object/flip_object/add_noise_object affect just ONE detected object - "
+    "use these only when the user names a specific object (e.g. 'the second dog', 'the detected "
+    "car'): call detect_objects first, find the matching entry in its \"detections\" list, and "
+    "pass its \"index\" as object_index. "
+    "Edits build on each other: if the user already blurred the image and now asks to rotate it, "
+    "rotate the blurred version - each new edit applies to the current state of the image, not "
+    "back to the original upload."
 )
 
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
 _current_chat_id: ContextVar[Optional[str]] = ContextVar("current_chat_id", default=None)
-# Set by blur_image (a tool) and read by run_agent after the loop, so the
-# blurred image bytes never have to pass through the LLM's message history.
-_current_processed_image_b64: ContextVar[Optional[str]] = ContextVar("current_processed_image_b64", default=None)
+
+
+def _normalized_chat_id() -> str:
+    return (_current_chat_id.get() or "chat").strip() or "chat"
+
+
+# The result of the most recent edit for each chat, so edits build on each other
+# (blur, then rotate, rotates the blurred version) instead of every tool always
+# starting over from the original upload. Keyed by chat_id, not a ContextVar, for
+# the same reason as _processed_images below: tool calls run in a copied context,
+# so a write from inside one tool call would never be visible to the next one in
+# the same turn. Reset (popped) whenever chat() sees a genuinely new upload.
+_current_working_image: dict[str, str] = {}
+
+
+def _get_current_image() -> Optional[str]:
+    return _current_working_image.get(_normalized_chat_id()) or _current_image_b64.get()
+
+
+# Populated by detect_objects, read by blur_object/rotate_object/flip_object/add_noise_object
+# to resolve "the second dog" to actual pixel coordinates without asking the LLM to copy box
+# coordinates by hand. Keyed by chat_id for the same reason as _current_working_image above.
+_detections_by_chat: dict[str, list[dict]] = {}
 
 
 def _upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "image/jpeg") -> None:
@@ -61,10 +95,40 @@ def _upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "image/jpe
     s3_client = boto3.client("s3", region_name=AWS_REGION)
     s3_client.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=data, ContentType=content_type)
 
+def _fetch_detections(prediction_id: str) -> list[dict]:
+    """Fetch per-object bounding boxes for a prediction. /predict itself only
+    returns labels, not boxes - the box coordinates live behind a separate
+    GET /prediction/{uid} call, same as _fetch_annotated_image below."""
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(f"{YOLO_SERVICE_URL}/prediction/{prediction_id}")
+            response.raise_for_status()
+        detection_objects = response.json().get("detection_objects", [])
+    except (httpx.HTTPError, ValueError, TypeError):
+        return []
+
+    detections = []
+    for index, obj in enumerate(detection_objects):
+        try:
+            box = json.loads(obj["box"])
+        except (json.JSONDecodeError, TypeError, KeyError):
+            continue
+        detections.append({"index": index, "label": obj.get("label"), "score": obj.get("score"), "box": box})
+    return detections
+
+
 @tool
 def detect_objects() -> str:
-    """Detect and identify objects in the image provided by the user using YOLO object detection."""
-    image_b64 = _current_image_b64.get()
+    """Detect and identify objects in the image provided by the user using YOLO object detection.
+
+    The result includes a "detections" list, each with an "index", "label",
+    "score", and "box" ([left, top, right, bottom] in pixels). To edit one
+    specific object (e.g. "blur the second dog from the right"), first look
+    at the boxes here to figure out which index that is (e.g. compare the
+    left/right x-coordinates of every "dog" entry), then pass that index as
+    object_index to blur_object/rotate_object/flip_object/add_noise_object.
+    """
+    image_b64 = _get_current_image()
     if not image_b64:
         return json.dumps({"error": "No image was provided by the user."})
 
@@ -75,7 +139,7 @@ def detect_objects() -> str:
         return json.dumps({"error": f"Invalid image encoding: {exc}"})
 
     prediction_id = str(uuid.uuid4())
-    chat_id = (_current_chat_id.get() or "chat").strip() or "chat"
+    chat_id = _normalized_chat_id()
     filename = "image.jpg"
     image_s3_key = f"{chat_id}/{prediction_id}/original/{filename}"
 
@@ -95,7 +159,7 @@ def detect_objects() -> str:
                 json={"image_s3_key": image_s3_key, "prediction_id": prediction_id},
             )
             response.raise_for_status()
-        return json.dumps(response.json())
+        result = response.json()
     except httpx.HTTPStatusError as exc:
         logger.exception("detect_objects: YOLO service returned non-2xx status")
         detail = exc.response.text if exc.response is not None else str(exc)
@@ -104,42 +168,263 @@ def detect_objects() -> str:
         logger.exception("detect_objects: failed HTTP call to YOLO service")
         return json.dumps({"error": f"Failed to call YOLO service: {exc}"})
 
+    detections = _fetch_detections(prediction_id)
+    _detections_by_chat[chat_id] = detections
+    result["detections"] = detections
+    return json.dumps(result)
 
-async def _call_mcp_blur(image_b64: str, radius: float) -> str:
-    async with MultiServerMCPClient(
+
+def _extract_mcp_text(result: Any) -> str:
+    """MCP tool results can come back as a plain string or as a list of
+    content blocks (e.g. [{"type": "text", "text": "..."}]) - unwrap either
+    shape without touching the raw payload (no LLM-text sanitization here,
+    since this may carry base64 image bytes)."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, list):
+        parts = []
+        for block in result:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return str(result)
+
+
+async def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
+    client = MultiServerMCPClient(
         {
             "img-proc": {
                 "url": IMG_PROC_MCP_URL,
                 "transport": "http",
             }
         }
-    ) as client:
-        tools = await client.get_tools()
-        blur_tool = next(t for t in tools if t.name == "blur")
-        return await blur_tool.ainvoke({"image_b64": image_b64, "radius": radius})
+    )
+    tools = await client.get_tools()
+    mcp_tool = next(t for t in tools if t.name == tool_name)
+    result = await mcp_tool.ainvoke(arguments)
+    return _extract_mcp_text(result)
+
+
+# Tool calls run in a copied context (LangChain's tracing machinery), so a
+# ContextVar written inside a tool never propagates back to run_agent's
+# context. Stash processed image bytes in a plain dict instead, keyed by a
+# small id the tool hands back in its (LLM-visible) JSON output - the same
+# side-channel trick detect_objects/prediction_id/annotated_image already use.
+_processed_images: dict[str, str] = {}
+
+
+async def _call_mcp_object_op(operation: str, arguments: dict, image_b64: str, box: list) -> str:
+    left, top, right, bottom = (int(round(v)) for v in box)
+    region_b64 = await _call_mcp_tool(
+        "crop", {"image_b64": image_b64, "left": left, "top": top, "right": right, "bottom": bottom}
+    )
+    transformed_region_b64 = await _call_mcp_tool(operation, {"image_b64": region_b64, **arguments})
+    return await _call_mcp_tool(
+        "paste", {"base_image_b64": image_b64, "region_b64": transformed_region_b64, "left": left, "top": top}
+    )
+
+
+def _run_image_op(operation: str, arguments: dict, object_index: int | None = None) -> str:
+    chat_id = _normalized_chat_id()
+    image_b64 = _get_current_image()
+    if not image_b64:
+        return json.dumps({"error": "No image was provided by the user."})
+
+    box = None
+    if object_index is not None:
+        detections = _detections_by_chat.get(chat_id, [])
+        box = next((d["box"] for d in detections if d["index"] == object_index), None)
+        if box is None:
+            return json.dumps(
+                {"error": f"No detected object with index {object_index}. Call detect_objects first."}
+            )
+
+    try:
+        if box is None:
+            result_b64 = asyncio.run(_call_mcp_tool(operation, {"image_b64": image_b64, **arguments}))
+        else:
+            result_b64 = asyncio.run(_call_mcp_object_op(operation, arguments, image_b64, box))
+    except Exception as exc:
+        logger.exception("%s: failed to call img-proc MCP server", operation)
+        return json.dumps({"error": f"Failed to {operation} image: {exc}"})
+
+    _current_working_image[chat_id] = result_b64  # so the next edit builds on this one
+    operation_id = str(uuid.uuid4())
+    _processed_images[operation_id] = result_b64
+    result = {"status": "ok", "operation": operation, "operation_id": operation_id, **arguments}
+    if object_index is not None:
+        result["object_index"] = object_index
+    return json.dumps(result)
 
 
 @tool
 def blur_image(radius: float = 2.0) -> str:
-    """Apply a Gaussian blur to the image provided by the user, using the image-processing MCP service."""
-    image_b64 = _current_image_b64.get()
-    if not image_b64:
-        return json.dumps({"error": "No image was provided by the user."})
+    """Apply a Gaussian blur to the whole image provided by the user (or its current edited state).
 
-    try:
-        blurred_b64 = asyncio.run(_call_mcp_blur(image_b64, radius))
-    except Exception as exc:
-        logger.exception("blur_image: failed to call img-proc MCP server")
-        return json.dumps({"error": f"Failed to blur image: {exc}"})
+    Use this for requests about "the image"/"this image" as a whole. For a
+    request naming one specific detected object (e.g. "blur the second dog"),
+    use blur_object instead.
 
-    _current_processed_image_b64.set(blurred_b64)
-    return json.dumps({"status": "ok", "operation": "blur", "radius": radius})
+    Args:
+        radius: Blur strength in pixels. There is no fixed maximum - use small
+            values like 1-3 for a subtle/light blur, and larger values like
+            8-15 or more for a heavy/strong blur, based on what the user asks for.
+    """
+    return _run_image_op("blur", {"radius": radius})
+
+
+@tool
+def blur_object(object_index: int, radius: float = 2.0) -> str:
+    """Apply a Gaussian blur to just one detected object in the image.
+
+    Call detect_objects first, find the matching entry in its "detections"
+    list (e.g. "the second dog"), and pass its "index" as object_index here.
+
+    Args:
+        object_index: The "index" of the target object from detect_objects's "detections" list.
+        radius: Blur strength in pixels, same scale as blur_image.
+    """
+    return _run_image_op("blur", {"radius": radius}, object_index=object_index)
+
+
+@tool
+def rotate_image(angle: float) -> str:
+    """Rotate the whole image provided by the user (or its current edited state) counter-clockwise.
+
+    Use this for requests about "the image"/"this image" as a whole. For a
+    request naming one specific detected object (e.g. "rotate the detected
+    car"), use rotate_object instead.
+
+    Args:
+        angle: Rotation angle in degrees, e.g. 90 for a quarter turn.
+    """
+    return _run_image_op("rotate", {"angle": angle, "expand": True})
+
+
+@tool
+def rotate_object(object_index: int, angle: float) -> str:
+    """Rotate just one detected object in the image counter-clockwise.
+
+    Call detect_objects first, find the matching entry in its "detections"
+    list, and pass its "index" as object_index here. The object keeps its
+    original size (corners of the rotated content get clipped) so it can be
+    placed back into the image.
+
+    Args:
+        object_index: The "index" of the target object from detect_objects's "detections" list.
+        angle: Rotation angle in degrees, e.g. 90 for a quarter turn.
+    """
+    return _run_image_op("rotate", {"angle": angle, "expand": False}, object_index=object_index)
+
+
+@tool
+def flip_image(direction: str = "horizontal") -> str:
+    """Flip the whole image provided by the user (or its current edited state).
+
+    Use this for requests about "the image"/"this image" as a whole. For a
+    request naming one specific detected object (e.g. "flip the second dog"),
+    use flip_object instead.
+
+    Args:
+        direction: 'horizontal' to mirror left-right, or 'vertical' to flip upside down.
+    """
+    return _run_image_op("flip", {"direction": direction})
+
+
+@tool
+def flip_object(object_index: int, direction: str = "horizontal") -> str:
+    """Flip just one detected object in the image.
+
+    Call detect_objects first, find the matching entry in its "detections"
+    list, and pass its "index" as object_index here.
+
+    Args:
+        object_index: The "index" of the target object from detect_objects's "detections" list.
+        direction: 'horizontal' to mirror left-right, or 'vertical' to flip upside down.
+    """
+    return _run_image_op("flip", {"direction": direction}, object_index=object_index)
+
+
+@tool
+def resize_image(width: int, height: int) -> str:
+    """Resize the whole image provided by the user (or its current edited state) to an exact width and height in pixels.
+
+    Args:
+        width: Target width in pixels.
+        height: Target height in pixels.
+    """
+    return _run_image_op("resize", {"width": width, "height": height})
+
+
+@tool
+def crop_image(left: int, top: int, right: int, bottom: int) -> str:
+    """Crop the whole image provided by the user (or its current edited state) to a bounding box, in pixels from the top-left corner.
+
+    Args:
+        left: Left edge of the box (x, from the left).
+        top: Top edge of the box (y, from the top).
+        right: Right edge of the box (x, from the left).
+        bottom: Bottom edge of the box (y, from the top).
+    """
+    return _run_image_op("crop", {"left": left, "top": top, "right": right, "bottom": bottom})
+
+
+@tool
+def add_noise_image(amount: float = 0.05) -> str:
+    """Add salt-and-pepper noise to the whole image provided by the user (or its current edited state).
+
+    Use this for requests about "the image"/"this image" as a whole. For a
+    request naming one specific detected object (e.g. "add noise to the
+    detected car"), use add_noise_object instead.
+
+    Args:
+        amount: Fraction of pixels to affect, between 0 and 1 (e.g. 0.05 = 5% of pixels).
+    """
+    return _run_image_op("add_noise", {"amount": amount})
+
+
+@tool
+def add_noise_object(object_index: int, amount: float = 0.05) -> str:
+    """Add salt-and-pepper noise to just one detected object in the image.
+
+    Call detect_objects first, find the matching entry in its "detections"
+    list, and pass its "index" as object_index here.
+
+    Args:
+        object_index: The "index" of the target object from detect_objects's "detections" list.
+        amount: Fraction of pixels to affect, between 0 and 1 (e.g. 0.05 = 5% of pixels).
+    """
+    return _run_image_op("add_noise", {"amount": amount}, object_index=object_index)
 
 
 # Registry: map tool name -> tool function
 TOOLS = {
     detect_objects.name: detect_objects,
     blur_image.name: blur_image,
+    blur_object.name: blur_object,
+    rotate_image.name: rotate_image,
+    rotate_object.name: rotate_object,
+    flip_image.name: flip_image,
+    flip_object.name: flip_object,
+    resize_image.name: resize_image,
+    crop_image.name: crop_image,
+    add_noise_image.name: add_noise_image,
+    add_noise_object.name: add_noise_object,
+}
+
+IMAGE_OP_TOOL_NAMES = {
+    blur_image.name,
+    blur_object.name,
+    rotate_image.name,
+    rotate_object.name,
+    flip_image.name,
+    flip_object.name,
+    resize_image.name,
+    crop_image.name,
+    add_noise_image.name,
+    add_noise_object.name,
 }
 
 
@@ -359,8 +644,8 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     tools_called: list[str] = []
     prediction_id: Optional[str] = None
     annotated_image: Optional[str] = None
+    processed_image: Optional[str] = None
     context_limit_exceeded = False
-    _current_processed_image_b64.set(None)
     final_response = ""
     total_input_tokens: int | None = None
     total_output_tokens: int | None = None
@@ -424,6 +709,15 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                     if isinstance(parsed_prediction_id, str) and parsed_prediction_id:
                         prediction_id = parsed_prediction_id
                         annotated_image = _fetch_annotated_image(parsed_prediction_id)
+
+            if tool_name in IMAGE_OP_TOOL_NAMES:
+                parsed = _parse_tool_json(tool_result.content)
+                if parsed:
+                    operation_id = parsed.get("operation_id")
+                    if isinstance(operation_id, str) and operation_id:
+                        # Overwrite, don't accumulate - each edit builds on the last, so
+                        # the final one already reflects every edit made this turn.
+                        processed_image = _processed_images.pop(operation_id, processed_image)
     else:
         context_limit_exceeded = True
         final_response = "Agent stopped because it reached the maximum number of tool iterations."
@@ -437,7 +731,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         "response": final_response,
         "prediction_id": prediction_id,
         "annotated_image": annotated_image,
-        "processed_image": _current_processed_image_b64.get(),
+        "processed_image": processed_image,
         "agent_loop_time_s": time.perf_counter() - start_time,
         "iterations": iterations,
         "tools_called": tools_called,
@@ -493,18 +787,40 @@ class ChatResponse(BaseModel):
     tokens_used: TokenUsage
 
 
+# Small tool-calling models can "pattern-lock" onto the phrasing of their own
+# prior replies (e.g. several "The image has been successfully X'd." in a row)
+# and start completing that template instead of calling a tool for a new
+# request. Only replay the most recent turns to the LLM to keep it grounded -
+# the original image is still recovered below by scanning the FULL history.
+MAX_HISTORY_MESSAGES = 4
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
-    lc_messages = []
     latest_image = None
-
     for msg in request.messages:
+        if msg.role == "user" and msg.image_base64:
+            latest_image = msg.image_base64          # saved for detect_objects tool
+
+    normalized_chat_id = (request.chat_id or "chat").strip() or "chat"
+    newest_message = request.messages[-1] if request.messages else None
+    if newest_message is not None and newest_message.role == "user" and newest_message.image_base64:
+        # A brand new image was just uploaded this turn - start a fresh edit chain
+        # instead of continuing to build on whatever was edited before it.
+        _current_working_image.pop(normalized_chat_id, None)
+
+    recent_messages = request.messages[-MAX_HISTORY_MESSAGES:]
+    while recent_messages and recent_messages[0].role != "user":
+        recent_messages = recent_messages[1:]  # Bedrock requires the first message to be from the user
+
+    lc_messages = []
+    for msg in recent_messages:
         if msg.role == "user":
             if msg.image_base64:
-                latest_image = msg.image_base64          # saved for detect_objects tool
-                content = msg.content + "\n[An image was uploaded. Use existing tools to analyze it according to user instructions.]"
+                reminder = "\n[An image was uploaded. Use the available tools to fulfill this request - do not claim to have performed an action without actually calling the matching tool.]"
             else:
-                content = msg.content
+                reminder = "\n[Use the available tools to fulfill this request - do not claim to have performed an action without actually calling the matching tool.]"
+            content = msg.content + reminder
             lc_messages.append(HumanMessage(content=content))
         else:
             lc_messages.append(AIMessage(content=msg.content))

@@ -33,6 +33,11 @@ pytest tests/
 | Tool | Description |
 |---|---|
 | `blur` | Apply Gaussian blur to a base64-encoded image. Takes `image_b64` and an optional `radius` (default `2.0`). Returns a base64-encoded PNG. |
+| `rotate` | Rotate an image counter-clockwise by `angle` degrees. Returns a base64-encoded PNG. |
+| `flip` | Flip an image. `direction` is `"horizontal"` (default) or `"vertical"`. Returns a base64-encoded PNG. |
+| `resize` | Resize an image to an exact `width` x `height` in pixels. Returns a base64-encoded PNG. |
+| `crop` | Crop an image to the box `(left, top, right, bottom)` in pixels. Returns a base64-encoded PNG. |
+| `add_noise` | Add salt-and-pepper noise to an image. `amount` is the fraction of pixels affected (default `0.05`). Returns a base64-encoded PNG. |
 
 ## Talking to the server directly
 

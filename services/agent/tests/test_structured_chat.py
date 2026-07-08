@@ -316,6 +316,7 @@ def test_blur_image_calls_mcp_and_hides_image_bytes_from_tool_output(monkeypatch
         return "Ymx1cnJlZC1pbWFnZQ=="
 
     monkeypatch.setattr(agent_app, "_call_mcp_blur", fake_call_mcp_blur)
+    monkeypatch.setattr(agent_app, "_blurred_images", {})
 
     image_token = agent_app._current_image_b64.set("aW1hZ2U=")
     try:
@@ -324,9 +325,13 @@ def test_blur_image_calls_mcp_and_hides_image_bytes_from_tool_output(monkeypatch
         agent_app._current_image_b64.reset(image_token)
 
     payload = json.loads(raw)
-    assert payload == {"status": "ok", "operation": "blur", "radius": 3.0}
+    assert payload["status"] == "ok"
+    assert payload["operation"] == "blur"
+    assert payload["radius"] == 3.0
     assert "Ymx1cnJlZC1pbWFnZQ==" not in raw
-    assert agent_app._current_processed_image_b64.get() == "Ymx1cnJlZC1pbWFnZQ=="
+
+    operation_id = payload["operation_id"]
+    assert agent_app._blurred_images[operation_id] == "Ymx1cnJlZC1pbWFnZQ=="
 
 
 def test_blur_image_returns_error_when_no_image_provided():
@@ -364,14 +369,15 @@ def test_run_agent_surfaces_processed_image_from_blur_tool(monkeypatch):
     second = AIMessage(content="done", tool_calls=[])
     monkeypatch.setattr(agent_app, "llm_with_tools", FakeLLMWithTools([first, second]))
 
+    monkeypatch.setattr(agent_app, "_blurred_images", {"op-1": "Ymx1cnJlZC1pbWFnZQ=="})
+
     class FakeBlurTool:
         name = "blur_image"
 
         def invoke(self, tool_call):
-            agent_app._current_processed_image_b64.set("Ymx1cnJlZC1pbWFnZQ==")
             return ToolMessage(
                 tool_call_id=tool_call["id"],
-                content=json.dumps({"status": "ok", "operation": "blur", "radius": 2.0}),
+                content=json.dumps({"status": "ok", "operation": "blur", "operation_id": "op-1", "radius": 2.0}),
             )
 
     monkeypatch.setitem(agent_app.TOOLS, "blur_image", FakeBlurTool())
@@ -380,6 +386,7 @@ def test_run_agent_surfaces_processed_image_from_blur_tool(monkeypatch):
 
     assert data["response"] == "done"
     assert data["processed_image"] == "Ymx1cnJlZC1pbWFnZQ=="
+    assert "op-1" not in agent_app._blurred_images
 
 
 def test_run_agent_processed_image_is_none_when_blur_not_called(monkeypatch):
