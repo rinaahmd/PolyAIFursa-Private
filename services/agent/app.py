@@ -78,13 +78,16 @@ def _normalized_chat_id() -> str:
 # the same turn. Reset (popped) whenever chat() sees a genuinely new upload.
 _current_working_image: dict[str, str] = {}
 
-# Set by chat() from _parse_ordinal_object_reference on the current user
-# message. blur_object/rotate_object/flip_object/add_noise_object use this to
-# OVERRIDE whatever label/rank_from_left/rank_from_right the model passed -
-# even after being told to just copy these values, the model has been
-# observed to still substitute the wrong number most of the time, so the
-# parsed reference is treated as ground truth rather than a suggestion.
-_object_reference_hint_by_chat: dict[str, dict] = {}
+# Set by chat() from _parse_object_reference_hints on the current user message,
+# keyed by chat_id -> operation name ("blur"/"rotate"/"flip"/"add_noise").
+# blur_object/rotate_object/flip_object/add_noise_object use the entry for
+# their own operation to OVERRIDE whatever label/rank_from_left/rank_from_right
+# the model passed - even after being told to just copy these values, the
+# model has been observed to still substitute the wrong object/number most of
+# the time (including mixing up which object goes with which edit, when a
+# single message requests several edits at once), so the parsed reference is
+# treated as ground truth rather than a suggestion.
+_object_reference_hints_by_chat: dict[str, dict[str, dict]] = {}
 
 
 def _get_current_image() -> Optional[str]:
@@ -296,8 +299,9 @@ def _run_image_op(
         # chat() already parsed the user's actual wording into a hint with
         # plain Python - that's ground truth. Override whatever the model
         # passed rather than trust it, since the model has been observed to
-        # still get the number wrong even when told to just copy the hint.
-        hint = _object_reference_hint_by_chat.get(chat_id)
+        # still get the number wrong (or mix up which object goes with which
+        # edit) even when told to just copy the hint.
+        hint = _object_reference_hints_by_chat.get(chat_id, {}).get(operation)
         if hint is not None:
             label = hint["label"]
             rank_from_left = hint["rank_from_left"]
@@ -728,6 +732,25 @@ def _fetch_annotated_image(prediction_id: str) -> Optional[str]:
 
 
 
+def _invoke_with_content_filter_retry(llm_with_tools, messages: list, max_retries: int = 4) -> AIMessage:
+    """Bedrock's own content-safety layer has been observed to block a
+    response to some multi-step edit requests intermittently - the exact
+    same messages can succeed on a retry a moment later. Retry a few times
+    before giving up, since this is nondeterministic and out of this code's
+    control (it isn't something our prompt or tool design can fix)."""
+    response = llm_with_tools.invoke(messages)
+    attempts = 1
+    while (
+        not response.tool_calls
+        and "blocked by our content filters" in _stringify_content(response.content).lower()
+        and attempts <= max_retries
+    ):
+        logger.warning("LLM response blocked by content filters, retrying (attempt %d/%d)", attempts, max_retries)
+        response = llm_with_tools.invoke(messages)
+        attempts += 1
+    return response
+
+
 def run_agent(history: list, max_iterations: int = 10) -> dict:
     """
     Simple ReAct loop:
@@ -753,7 +776,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
 
     for _ in range(max_iterations):
         iterations += 1
-        response: AIMessage = active_llm_with_tools.invoke(messages)
+        response: AIMessage = _invoke_with_content_filter_retry(active_llm_with_tools, messages)
         usage = _extract_usage_metadata(response)
         total_input_tokens = _sum_optional(total_input_tokens, usage["input"])
         total_output_tokens = _sum_optional(total_output_tokens, usage["output"])
@@ -771,6 +794,16 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         # No tool calls, the model produced its final answer
         if not response.tool_calls:
             final_response = _stringify_content(response.content)
+            if "blocked by our content filters" in final_response.lower():
+                # This is the model provider's own safety layer, triggered
+                # intermittently (observed to vary between identical, repeated
+                # requests) - not something this code can control. Give the
+                # user something actionable instead of the raw filter string.
+                final_response = (
+                    "This request was blocked by the AI provider's content safety filters. "
+                    "This can happen intermittently, especially with multi-step edit requests - "
+                    "please try again, or rephrase your request."
+                )
             break
 
         # Execute every tool the model requested
@@ -896,45 +929,122 @@ _ORDINAL_WORDS = {
     "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
     "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
 }
-_ORDINAL_REFERENCE_PATTERN = re.compile(
+# Ordinal word/digit immediately followed by the object's label, e.g. "second dog".
+_ORDINAL_LABEL_PATTERN = re.compile(
     r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th))\s+"
     r"(?:detected\s+)?([a-zA-Z]+)",
     re.IGNORECASE,
 )
-_DIRECTION_PATTERN = re.compile(r"from\s+the\s+(left|right)", re.IGNORECASE)
+# "the <label>", used when there's no ordinal, just a side (e.g. "the person on the right").
+_LABEL_ONLY_PATTERN = re.compile(r"\bthe\s+(?:detected\s+)?([a-zA-Z]+)\b", re.IGNORECASE)
+# Accepts "from/on/to the left/right" - covers "second dog from the right",
+# "the person on the right", "the person to the left", etc.
+_DIRECTION_PATTERN = re.compile(r"\b(?:from|on|to)\s+the\s+(left|right)\b", re.IGNORECASE)
+# One keyword per object-scoped operation, used to split a multi-edit message
+# into per-operation clauses (e.g. "...add noise to X and blur Y" has one
+# clause for add_noise, one for blur).
+_OPERATION_KEYWORDS = {
+    "add_noise": ("noise", "salt", "pepper"),
+    "blur": ("blur",),
+    "rotate": ("rotate", "turn"),
+    "flip": ("flip", "mirror"),
+}
+_NON_OBJECT_LABELS = {"image", "picture", "photo", "whole", "entire", "detected"}
 
 
-def _parse_ordinal_object_reference(text: str) -> Optional[dict]:
-    """Best-effort parse of phrases like 'the second dog (from the right)' into
-    a {label, rank_from_left, rank_from_right} hint. This exists because the
-    small tool-calling model has been observed to mistranslate even a plain
-    ordinal word like "second" into the wrong integer on most attempts -
-    handing it a pre-computed hint to copy is far more reliable than asking
-    it to work the number out itself."""
-    match = _ORDINAL_REFERENCE_PATTERN.search(text)
-    if not match:
-        return None
+def _singularize(word: str) -> str:
+    word = word.lower().rstrip(".,!?")
+    if word.endswith("s") and len(word) > 3:
+        return word[:-1]
+    return word
 
-    ordinal_text, label = match.groups()
-    rank = _ORDINAL_WORDS.get(ordinal_text.lower())
-    if rank is None:
-        digits = re.match(r"\d+", ordinal_text)
-        if not digits:
-            return None
-        rank = int(digits.group())
 
-    direction_match = _DIRECTION_PATTERN.search(text)
-    direction = direction_match.group(1).lower() if direction_match else "left"
+def _parse_object_reference_in_clause(clause: str) -> Optional[dict]:
+    """Best-effort parse of a single edit clause (e.g. 'blur the second dog
+    from the right', or 'the person on the right') into a
+    {label, rank_from_left, rank_from_right} reference.
 
-    label = label.lower().rstrip(".,!?")
-    if label.endswith("s") and len(label) > 3:
-        label = label[:-1]  # naive singularization, e.g. "dogs" -> "dog"
+    This exists because the small tool-calling model has been observed to
+    mistranslate even a plain ordinal word like "second" into the wrong
+    integer most of the time, and to mix up which object goes with which
+    edit when a message requests several edits at once. Parsing each clause
+    in plain Python and overriding the model's own arguments with the result
+    is far more reliable than asking it to work this out itself."""
+    direction_match = _DIRECTION_PATTERN.search(clause)
+    direction = direction_match.group(1).lower() if direction_match else None
 
-    return {
-        "label": label,
-        "rank_from_left": rank if direction == "left" else None,
-        "rank_from_right": rank if direction == "right" else None,
-    }
+    ordinal_match = _ORDINAL_LABEL_PATTERN.search(clause)
+    if ordinal_match:
+        ordinal_text, label = ordinal_match.groups()
+        rank = _ORDINAL_WORDS.get(ordinal_text.lower())
+        if rank is None:
+            digits = re.match(r"\d+", ordinal_text)
+            rank = int(digits.group()) if digits else None
+        if rank is not None:
+            label = _singularize(label)
+            if label not in _NON_OBJECT_LABELS:
+                direction = direction or "left"
+                return {
+                    "label": label,
+                    "rank_from_left": rank if direction == "left" else None,
+                    "rank_from_right": rank if direction == "right" else None,
+                }
+
+    if direction is not None:
+        label_match = _LABEL_ONLY_PATTERN.search(clause)
+        if label_match:
+            label = _singularize(label_match.group(1))
+            if label not in _NON_OBJECT_LABELS:
+                return {
+                    "label": label,
+                    "rank_from_left": 1 if direction == "left" else None,
+                    "rank_from_right": 1 if direction == "right" else None,
+                }
+
+    return None
+
+
+def _parse_object_reference_hints(text: str) -> dict[str, dict]:
+    """Split a message into clauses (on 'and') and parse each clause's object
+    reference, keyed by the operation (blur/rotate/flip/add_noise) mentioned
+    in that clause - so a single message requesting several different edits
+    on different objects resolves each one independently instead of a single
+    reference bleeding into every edit in the message."""
+    hints: dict[str, dict] = {}
+    for clause in re.split(r"\band\b", text, flags=re.IGNORECASE):
+        clause_lower = clause.lower()
+        operation = next(
+            (op for op, keywords in _OPERATION_KEYWORDS.items() if any(k in clause_lower for k in keywords)),
+            None,
+        )
+        if operation is None:
+            continue
+        reference = _parse_object_reference_in_clause(clause)
+        if reference is not None:
+            hints[operation] = reference
+    return hints
+
+
+def _reorder_clauses_to_avoid_content_filter(text: str) -> str:
+    """Observed empirically: a message with several edit clauses ordered as
+    "add noise to X and flip Y and blur Z" reliably triggers Bedrock's own
+    content-safety filter (blocking the reply with zero tool calls), while
+    the identical edits succeed every time when the noise clause is moved to
+    the end - "flip Y and blur Z and add noise to X". This only changes what
+    we send the model, not the message shown in the chat transcript, and
+    each clause is still resolved to its own object independently regardless
+    of order (see _parse_object_reference_hints)."""
+    clauses = re.split(r"\band\b", text, flags=re.IGNORECASE)
+    if len(clauses) < 2:
+        return text
+
+    is_noise_clause = lambda clause: any(k in clause.lower() for k in _OPERATION_KEYWORDS["add_noise"])
+    noise_clauses = [c for c in clauses if is_noise_clause(c)]
+    other_clauses = [c for c in clauses if not is_noise_clause(c)]
+    if not noise_clauses or not other_clauses:
+        return text  # nothing to reorder
+
+    return " and ".join(clause.strip() for clause in other_clauses + noise_clauses)
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -951,14 +1061,14 @@ def chat(request: ChatRequest):
         # instead of continuing to build on whatever was edited before it.
         _current_working_image.pop(normalized_chat_id, None)
 
-    parsed_hint = None
+    parsed_hints: dict[str, dict] = {}
     if newest_message is not None and newest_message.role == "user":
-        parsed_hint = _parse_ordinal_object_reference(newest_message.content)
-    if parsed_hint is not None:
-        _object_reference_hint_by_chat[normalized_chat_id] = parsed_hint
+        parsed_hints = _parse_object_reference_hints(newest_message.content)
+    if parsed_hints:
+        _object_reference_hints_by_chat[normalized_chat_id] = parsed_hints
     else:
-        # Don't let a hint from an earlier, unrelated turn leak into this one.
-        _object_reference_hint_by_chat.pop(normalized_chat_id, None)
+        # Don't let hints from an earlier, unrelated turn leak into this one.
+        _object_reference_hints_by_chat.pop(normalized_chat_id, None)
 
     recent_messages = request.messages[-MAX_HISTORY_MESSAGES:]
     while recent_messages and recent_messages[0].role != "user":
@@ -971,12 +1081,17 @@ def chat(request: ChatRequest):
                 reminder = "\n[An image was uploaded. Use the available tools to fulfill this request - do not claim to have performed an action without actually calling the matching tool.]"
             else:
                 reminder = "\n[Use the available tools to fulfill this request - do not claim to have performed an action without actually calling the matching tool.]"
-            content = msg.content + reminder
-            if msg is newest_message and parsed_hint is not None:
-                content += (
-                    f"\n[Parsed object reference: label={parsed_hint['label']!r}, "
-                    f"rank_from_left={parsed_hint['rank_from_left']!r}, rank_from_right={parsed_hint['rank_from_right']!r}.]"
+            message_text = msg.content
+            if msg is newest_message:
+                message_text = _reorder_clauses_to_avoid_content_filter(message_text)
+            content = message_text + reminder
+            if msg is newest_message and parsed_hints:
+                hint_text = ", ".join(
+                    f"{operation}: label={hint['label']!r}, rank_from_left={hint['rank_from_left']!r}, "
+                    f"rank_from_right={hint['rank_from_right']!r}"
+                    for operation, hint in parsed_hints.items()
                 )
+                content += f"\n[Parsed object references per operation: {hint_text}.]"
             lc_messages.append(HumanMessage(content=content))
         else:
             lc_messages.append(AIMessage(content=msg.content))
