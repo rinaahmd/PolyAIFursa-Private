@@ -6,6 +6,7 @@ A LangChain-powered AI vision agent with a manual ReAct loop. Accepts text and b
 
 - Python 3.10+
 - A running YOLO service (optional - only needed for `detect_objects`)
+- A running [img-proc-mcp](../img-proc-mcp/README.md) server (optional - only needed for `blur_image`)
 
 
 ## Setup
@@ -31,6 +32,7 @@ cp .env.example .env
 | `AWS_REGION` | `us-east-1` | AWS region for Bedrock and S3 |
 | `AWS_S3_BUCKET` | - | S3 bucket for original and predicted images |
 | `YOLO_SERVICE_URL` | `http://host.docker.internal:8080` (docker run) or `http://yolo:8080` (Docker Compose) | URL of the YOLO microservice |
+| `IMG_PROC_MCP_URL` | `http://host.docker.internal:9000/mcp` (docker run) or `http://img-proc-mcp:9000/mcp` (Docker Compose) | URL of the image-processing MCP server |
 
 Deployment notes:
 
@@ -102,6 +104,7 @@ Response:
   "response": "string",
   "prediction_id": "string | null",
   "annotated_image": "string | null",
+  "processed_image": "string | null",
   "agent_loop_time_s": 0.0,
   "iterations": 1,
   "tools_called": [],
@@ -113,6 +116,8 @@ Response:
   }
 }
 ```
+
+`processed_image` is a base64-encoded PNG set when the agent calls the `blur_image` tool (see below).
 
 ### `GET /health`
 

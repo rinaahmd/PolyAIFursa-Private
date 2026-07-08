@@ -4,6 +4,7 @@ python-dotenv
 langchain
 langgraph
 langchain-core
+langchain-mcp-adapters
 
 langchain[openai]
 langchain[anthropic]

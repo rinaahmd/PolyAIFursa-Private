@@ -307,3 +307,88 @@ def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
     expected_key = f"chat-42/{prediction_id}/original/image.jpg"
     assert body["image_s3_key"] == expected_key
     assert captured["uploaded_key"] == expected_key
+
+
+def test_blur_image_calls_mcp_and_hides_image_bytes_from_tool_output(monkeypatch):
+    async def fake_call_mcp_blur(image_b64, radius):
+        assert image_b64 == "aW1hZ2U="
+        assert radius == 3.0
+        return "Ymx1cnJlZC1pbWFnZQ=="
+
+    monkeypatch.setattr(agent_app, "_call_mcp_blur", fake_call_mcp_blur)
+
+    image_token = agent_app._current_image_b64.set("aW1hZ2U=")
+    try:
+        raw = agent_app.blur_image.invoke({"radius": 3.0})
+    finally:
+        agent_app._current_image_b64.reset(image_token)
+
+    payload = json.loads(raw)
+    assert payload == {"status": "ok", "operation": "blur", "radius": 3.0}
+    assert "Ymx1cnJlZC1pbWFnZQ==" not in raw
+    assert agent_app._current_processed_image_b64.get() == "Ymx1cnJlZC1pbWFnZQ=="
+
+
+def test_blur_image_returns_error_when_no_image_provided():
+    image_token = agent_app._current_image_b64.set(None)
+    try:
+        raw = agent_app.blur_image.invoke({})
+    finally:
+        agent_app._current_image_b64.reset(image_token)
+
+    assert json.loads(raw) == {"error": "No image was provided by the user."}
+
+
+def test_blur_image_returns_error_when_mcp_call_fails(monkeypatch):
+    async def failing_call_mcp_blur(image_b64, radius):
+        raise RuntimeError("img-proc-mcp unreachable")
+
+    monkeypatch.setattr(agent_app, "_call_mcp_blur", failing_call_mcp_blur)
+
+    image_token = agent_app._current_image_b64.set("aW1hZ2U=")
+    try:
+        raw = agent_app.blur_image.invoke({})
+    finally:
+        agent_app._current_image_b64.reset(image_token)
+
+    payload = json.loads(raw)
+    assert "error" in payload
+    assert "img-proc-mcp unreachable" in payload["error"]
+
+
+def test_run_agent_surfaces_processed_image_from_blur_tool(monkeypatch):
+    first = AIMessage(
+        content="calling blur tool",
+        tool_calls=[{"id": "tool-1", "name": "blur_image", "args": {"radius": 2.0}}],
+    )
+    second = AIMessage(content="done", tool_calls=[])
+    monkeypatch.setattr(agent_app, "llm_with_tools", FakeLLMWithTools([first, second]))
+
+    class FakeBlurTool:
+        name = "blur_image"
+
+        def invoke(self, tool_call):
+            agent_app._current_processed_image_b64.set("Ymx1cnJlZC1pbWFnZQ==")
+            return ToolMessage(
+                tool_call_id=tool_call["id"],
+                content=json.dumps({"status": "ok", "operation": "blur", "radius": 2.0}),
+            )
+
+    monkeypatch.setitem(agent_app.TOOLS, "blur_image", FakeBlurTool())
+
+    data = agent_app.run_agent([HumanMessage(content="blur it")])
+
+    assert data["response"] == "done"
+    assert data["processed_image"] == "Ymx1cnJlZC1pbWFnZQ=="
+
+
+def test_run_agent_processed_image_is_none_when_blur_not_called(monkeypatch):
+    monkeypatch.setattr(
+        agent_app,
+        "llm_with_tools",
+        FakeLLMWithTools([AIMessage(content="hello", tool_calls=[])]),
+    )
+
+    data = agent_app.run_agent([HumanMessage(content="hello")])
+
+    assert data["processed_image"] is None

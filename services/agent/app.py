@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import json
@@ -30,9 +31,11 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.tools import tool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel
 
 YOLO_SERVICE_URL = os.environ.get("YOLO_SERVICE_URL", "http://yolo:8080")
+IMG_PROC_MCP_URL = os.environ.get("IMG_PROC_MCP_URL", "http://img-proc-mcp:9000/mcp")
 MODEL = os.environ.get("MODEL")
 AWS_REGION = os.environ.get("AWS_REGION")
 AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET")
@@ -44,6 +47,9 @@ SYSTEM_PROMPT = (
 
 _current_image_b64: ContextVar[Optional[str]] = ContextVar("current_image_b64", default=None)
 _current_chat_id: ContextVar[Optional[str]] = ContextVar("current_chat_id", default=None)
+# Set by blur_image (a tool) and read by run_agent after the loop, so the
+# blurred image bytes never have to pass through the LLM's message history.
+_current_processed_image_b64: ContextVar[Optional[str]] = ContextVar("current_processed_image_b64", default=None)
 
 
 def _upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "image/jpeg") -> None:
@@ -99,9 +105,41 @@ def detect_objects() -> str:
         return json.dumps({"error": f"Failed to call YOLO service: {exc}"})
 
 
+async def _call_mcp_blur(image_b64: str, radius: float) -> str:
+    async with MultiServerMCPClient(
+        {
+            "img-proc": {
+                "url": IMG_PROC_MCP_URL,
+                "transport": "http",
+            }
+        }
+    ) as client:
+        tools = await client.get_tools()
+        blur_tool = next(t for t in tools if t.name == "blur")
+        return await blur_tool.ainvoke({"image_b64": image_b64, "radius": radius})
+
+
+@tool
+def blur_image(radius: float = 2.0) -> str:
+    """Apply a Gaussian blur to the image provided by the user, using the image-processing MCP service."""
+    image_b64 = _current_image_b64.get()
+    if not image_b64:
+        return json.dumps({"error": "No image was provided by the user."})
+
+    try:
+        blurred_b64 = asyncio.run(_call_mcp_blur(image_b64, radius))
+    except Exception as exc:
+        logger.exception("blur_image: failed to call img-proc MCP server")
+        return json.dumps({"error": f"Failed to blur image: {exc}"})
+
+    _current_processed_image_b64.set(blurred_b64)
+    return json.dumps({"status": "ok", "operation": "blur", "radius": radius})
+
+
 # Registry: map tool name -> tool function
 TOOLS = {
-    detect_objects.name: detect_objects
+    detect_objects.name: detect_objects,
+    blur_image.name: blur_image,
 }
 
 
@@ -322,6 +360,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     prediction_id: Optional[str] = None
     annotated_image: Optional[str] = None
     context_limit_exceeded = False
+    _current_processed_image_b64.set(None)
     final_response = ""
     total_input_tokens: int | None = None
     total_output_tokens: int | None = None
@@ -398,6 +437,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         "response": final_response,
         "prediction_id": prediction_id,
         "annotated_image": annotated_image,
+        "processed_image": _current_processed_image_b64.get(),
         "agent_loop_time_s": time.perf_counter() - start_time,
         "iterations": iterations,
         "tools_called": tools_called,
@@ -445,6 +485,7 @@ class ChatResponse(BaseModel):
     response: str
     prediction_id: str | None = None
     annotated_image: str | None = None
+    processed_image: str | None = None
     agent_loop_time_s: float
     iterations: int
     tools_called: list[str]
