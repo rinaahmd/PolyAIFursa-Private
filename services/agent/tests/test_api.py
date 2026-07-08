@@ -28,7 +28,10 @@ def test_chat_returns_structured_response_from_mocked_run_agent(monkeypatch):
 
     def fake_run_agent(history, max_iterations=10):
         assert len(history) == 1
-        assert history[0].content == "hello"
+        # chat() appends a per-turn reminder telling the model to actually use
+        # tools rather than claim to without calling them - see app.py's `reminder`.
+        assert history[0].content.startswith("hello")
+        assert "Use the available tools to fulfill this request" in history[0].content
         assert max_iterations == 10
         return mocked_response
 
