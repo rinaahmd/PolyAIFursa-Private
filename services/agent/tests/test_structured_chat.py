@@ -258,6 +258,13 @@ def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
                 "time_took": 0.1,
             }
 
+    class FakeDetectionsResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"detection_objects": []}
+
     class FakeHttpxClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -272,6 +279,11 @@ def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
             captured["url"] = url
             captured["post_kwargs"] = kwargs
             return FakeResponse()
+
+        def get(self, url, **kwargs):
+            # detect_objects also fetches per-object boxes via a follow-up
+            # GET /prediction/{uid} call - see _fetch_detections in app.py.
+            return FakeDetectionsResponse()
 
     monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", fake_upload_bytes_to_s3)
     monkeypatch.setattr(agent_app.httpx, "Client", FakeHttpxClient)
@@ -310,13 +322,13 @@ def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
 
 
 def test_blur_image_calls_mcp_and_hides_image_bytes_from_tool_output(monkeypatch):
-    async def fake_call_mcp_blur(image_b64, radius):
-        assert image_b64 == "aW1hZ2U="
-        assert radius == 3.0
+    async def fake_call_mcp_tool(tool_name, arguments):
+        assert tool_name == "blur"
+        assert arguments == {"image_b64": "aW1hZ2U=", "radius": 3.0}
         return "Ymx1cnJlZC1pbWFnZQ=="
 
-    monkeypatch.setattr(agent_app, "_call_mcp_blur", fake_call_mcp_blur)
-    monkeypatch.setattr(agent_app, "_blurred_images", {})
+    monkeypatch.setattr(agent_app, "_call_mcp_tool", fake_call_mcp_tool)
+    monkeypatch.setattr(agent_app, "_processed_images", {})
 
     image_token = agent_app._current_image_b64.set("aW1hZ2U=")
     try:
@@ -331,7 +343,7 @@ def test_blur_image_calls_mcp_and_hides_image_bytes_from_tool_output(monkeypatch
     assert "Ymx1cnJlZC1pbWFnZQ==" not in raw
 
     operation_id = payload["operation_id"]
-    assert agent_app._blurred_images[operation_id] == "Ymx1cnJlZC1pbWFnZQ=="
+    assert agent_app._processed_images[operation_id] == "Ymx1cnJlZC1pbWFnZQ=="
 
 
 def test_blur_image_returns_error_when_no_image_provided():
@@ -345,10 +357,10 @@ def test_blur_image_returns_error_when_no_image_provided():
 
 
 def test_blur_image_returns_error_when_mcp_call_fails(monkeypatch):
-    async def failing_call_mcp_blur(image_b64, radius):
+    async def failing_call_mcp_tool(tool_name, arguments):
         raise RuntimeError("img-proc-mcp unreachable")
 
-    monkeypatch.setattr(agent_app, "_call_mcp_blur", failing_call_mcp_blur)
+    monkeypatch.setattr(agent_app, "_call_mcp_tool", failing_call_mcp_tool)
 
     image_token = agent_app._current_image_b64.set("aW1hZ2U=")
     try:
@@ -369,7 +381,7 @@ def test_run_agent_surfaces_processed_image_from_blur_tool(monkeypatch):
     second = AIMessage(content="done", tool_calls=[])
     monkeypatch.setattr(agent_app, "llm_with_tools", FakeLLMWithTools([first, second]))
 
-    monkeypatch.setattr(agent_app, "_blurred_images", {"op-1": "Ymx1cnJlZC1pbWFnZQ=="})
+    monkeypatch.setattr(agent_app, "_processed_images", {"op-1": "Ymx1cnJlZC1pbWFnZQ=="})
 
     class FakeBlurTool:
         name = "blur_image"
@@ -386,7 +398,7 @@ def test_run_agent_surfaces_processed_image_from_blur_tool(monkeypatch):
 
     assert data["response"] == "done"
     assert data["processed_image"] == "Ymx1cnJlZC1pbWFnZQ=="
-    assert "op-1" not in agent_app._blurred_images
+    assert "op-1" not in agent_app._processed_images
 
 
 def test_run_agent_processed_image_is_none_when_blur_not_called(monkeypatch):
