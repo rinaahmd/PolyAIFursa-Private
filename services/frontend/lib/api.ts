@@ -6,6 +6,7 @@ export interface ChatResponse {
   response: string;
   prediction_id: string | null;
   annotated_image: string | null;
+  processed_image: string | null;
   agent_loop_time_s: number;
   iterations: number;
   tools_called: string[];

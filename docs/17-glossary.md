@@ -1,0 +1,33 @@
+# 17 - Glossary
+
+- API: contract that lets software components communicate.
+- Bedrock: AWS managed foundation model service.
+- Bridge network: Docker virtual network that connects containers and gives DNS.
+- Build arg: value available during docker image build.
+- Container: running instance of a docker image.
+- Docker Compose: tool to define and run multi-container applications.
+- Dockerfile: file with build instructions for docker image.
+- EC2: AWS virtual machine service.
+- Elastic IP: static public IP in AWS.
+- Endpoint: specific API path and method.
+- Environment variable: runtime configuration value.
+- FastAPI: Python framework for creating APIs.
+- Grafana: dashboard tool for visualizing metrics.
+- Health check: endpoint or probe to verify service liveness/readiness.
+- HTTP: protocol used for web requests and APIs.
+- Image: immutable packaged filesystem and metadata used to run containers.
+- Job (GitHub Actions): a group of steps executed on a runner.
+- LangChain: framework for LLM interactions and tool orchestration.
+- Network (Docker): virtual communication layer for containers.
+- Next.js: React framework for web applications.
+- Port mapping: host-port to container-port binding.
+- Prometheus: monitoring system that scrapes metrics.
+- React: JavaScript library for building UI components.
+- S3: AWS object storage.
+- Service (Compose): named container definition in docker-compose.yml.
+- SQLAlchemy: Python ORM for SQL databases.
+- SQLite: local file-based relational database.
+- SSH: secure shell protocol for remote command execution.
+- Step (GitHub Actions): individual command/action inside a job.
+- Volume: persistent storage mounted into containers.
+- Workflow (GitHub Actions): automated pipeline definition file.

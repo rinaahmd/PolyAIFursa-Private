@@ -1,0 +1,5 @@
+fastmcp
+pillow
+
+# Testing
+pytest
