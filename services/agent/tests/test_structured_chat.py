@@ -416,11 +416,11 @@ def test_run_agent_processed_image_is_none_when_blur_not_called(monkeypatch):
 @pytest.mark.parametrize(
     "clause, expected",
     [
-        ("flip the last person in the right", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
-        ("flip the last person on the right", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
-        ("flip the last person from the right", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
+        ("flip the last person in the right", {"label": "person", "rank_from_left": None, "rank_from_right": 1}),
+        ("flip the last person on the right", {"label": "person", "rank_from_left": None, "rank_from_right": 1}),
+        ("flip the last person from the right", {"label": "person", "rank_from_left": None, "rank_from_right": 1}),
         ("flip the last person", {"label": "person", "rank_from_left": None, "rank_from_right": 1}),
-        ("flip the last person from the left", {"label": "person", "rank_from_left": None, "rank_from_right": 1}),
+        ("flip the last person from the left", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
         ("blur the second dog from the right", {"label": "dog", "rank_from_left": None, "rank_from_right": 2}),
         ("flip the person on the left", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
     ],

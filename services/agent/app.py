@@ -1069,14 +1069,15 @@ def _parse_object_reference_in_clause(clause: str) -> Optional[dict]:
         if label_match:
             label = _singularize(label_match.group(1))
             if label not in _NON_OBJECT_LABELS:
-                # "last ... from/in/on the right" means the last object reached
-                # counting from the right, i.e. the leftmost one - and vice
-                # versa. With no direction given, "last" defaults to reading
-                # order, i.e. the rightmost one.
+                # "last" names the extreme of whichever side is stated, it does
+                # NOT reverse that side - "the last person on the right" still
+                # means the rightmost person, same as "the person on the right"
+                # with no "last" at all. With no direction given, "last"
+                # defaults to reading order, i.e. the rightmost one.
                 return {
                     "label": label,
-                    "rank_from_left": 1 if direction == "right" else None,
-                    "rank_from_right": 1 if direction != "right" else None,
+                    "rank_from_left": 1 if direction == "left" else None,
+                    "rank_from_right": 1 if direction != "left" else None,
                 }
 
     ordinal_match = _ORDINAL_LABEL_PATTERN.search(clause)
