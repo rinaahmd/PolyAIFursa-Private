@@ -90,8 +90,34 @@ _current_working_image: dict[str, str] = {}
 _object_reference_hints_by_chat: dict[str, dict[str, dict]] = {}
 
 
+def _working_image_s3_key(chat_id: str) -> str:
+    return f"{chat_id}/working_image.b64"
+
+
+def _original_image_s3_key(chat_id: str) -> str:
+    return f"{chat_id}/original_upload.b64"
+
+
 def _get_current_image() -> Optional[str]:
-    return _current_working_image.get(_normalized_chat_id()) or _current_image_b64.get()
+    chat_id = _normalized_chat_id()
+    cached = _current_working_image.get(chat_id)
+    if cached is not None:
+        return cached
+
+    # In-memory state is gone (process restart, or a fresh worker in a
+    # multi-instance deployment) - fall back to the copy persisted in S3 by
+    # the last successful edit for this chat, then to the raw upload
+    # persisted in S3 (in case the container fell over before any edit was
+    # ever applied, so no working-image copy exists yet), before giving up
+    # to whatever was passed in on this request.
+    restored = _download_working_image_from_s3(chat_id) or _download_bytes_from_s3_as_b64(
+        _original_image_s3_key(chat_id)
+    )
+    if restored is not None:
+        _current_working_image[chat_id] = restored
+        return restored
+
+    return _current_image_b64.get()
 
 
 # Populated by detect_objects, read by blur_object/rotate_object/flip_object/add_noise_object
@@ -108,6 +134,64 @@ def _upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "image/jpe
 
     s3_client = boto3.client("s3", region_name=AWS_REGION)
     s3_client.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=data, ContentType=content_type)
+
+
+def _download_bytes_from_s3(s3_key: str) -> Optional[bytes]:
+    if not AWS_REGION or not AWS_S3_BUCKET:
+        return None
+
+    s3_client = boto3.client("s3", region_name=AWS_REGION)
+    try:
+        response = s3_client.get_object(Bucket=AWS_S3_BUCKET, Key=s3_key)
+        return response["Body"].read()
+    except (BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError):
+        return None
+
+
+def _persist_b64_to_s3(image_b64: str, s3_key: str, label: str) -> None:
+    """Best-effort write-through - persistence failures (e.g. S3 unreachable)
+    must not fail the caller's request. `label` is just for the log line."""
+    try:
+        _upload_bytes_to_s3(base64.b64decode(image_b64), s3_key)
+    except RuntimeError:
+        logger.warning("Skipping %s S3 persistence: S3 is not configured", label)
+    except (BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError, binascii.Error, ValueError):
+        logger.exception("Failed to persist %s to S3 (key=%s)", label, s3_key)
+
+
+def _persist_working_image_to_s3(chat_id: str, image_b64: str) -> None:
+    """So the working image survives an agent restart or a request landing on
+    a different worker. The in-memory copy set by the caller is still
+    authoritative for the rest of this process's lifetime regardless of
+    whether this S3 write succeeds."""
+    _persist_b64_to_s3(image_b64, _working_image_s3_key(chat_id), "working image")
+
+
+def _persist_original_image_to_s3(chat_id: str, image_b64: str) -> None:
+    """So the raw upload survives a restart even if it falls over before any
+    edit tool has run (detect_objects/_run_image_op would otherwise be the
+    only things that ever write this chat's image to S3)."""
+    _persist_b64_to_s3(image_b64, _original_image_s3_key(chat_id), "original upload")
+
+
+def _download_bytes_from_s3_as_b64(s3_key: str) -> Optional[str]:
+    data = _download_bytes_from_s3(s3_key)
+    if data is None:
+        return None
+    return base64.b64encode(data).decode("utf-8")
+
+
+def _download_working_image_from_s3(chat_id: str) -> Optional[str]:
+    return _download_bytes_from_s3_as_b64(_working_image_s3_key(chat_id))
+
+
+def _delete_working_image_from_s3(chat_id: str) -> None:
+    if not AWS_REGION or not AWS_S3_BUCKET:
+        return
+    s3_client = boto3.client("s3", region_name=AWS_REGION)
+    with suppress(BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError):
+        s3_client.delete_object(Bucket=AWS_S3_BUCKET, Key=_working_image_s3_key(chat_id))
+
 
 def _fetch_detections(prediction_id: str) -> list[dict]:
     """Fetch per-object bounding boxes for a prediction. /predict itself only
@@ -323,6 +407,7 @@ def _run_image_op(
         return json.dumps({"error": f"Failed to {operation} image: {exc}"})
 
     _current_working_image[chat_id] = result_b64  # so the next edit builds on this one
+    _persist_working_image_to_s3(chat_id, result_b64)  # ...and survives a restart too
     operation_id = str(uuid.uuid4())
     _processed_images[operation_id] = result_b64
     result = {"status": "ok", "operation": operation, "operation_id": operation_id, **arguments}
@@ -936,10 +1021,16 @@ _ORDINAL_LABEL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 # "the <label>", used when there's no ordinal, just a side (e.g. "the person on the right").
-_LABEL_ONLY_PATTERN = re.compile(r"\bthe\s+(?:detected\s+)?([a-zA-Z]+)\b", re.IGNORECASE)
-# Accepts "from/on/to the left/right" - covers "second dog from the right",
-# "the person on the right", "the person to the left", etc.
-_DIRECTION_PATTERN = re.compile(r"\b(?:from|on|to)\s+the\s+(left|right)\b", re.IGNORECASE)
+# Skips over "last"/"detected" so "the last detected person" still captures "person", not "last".
+_LABEL_ONLY_PATTERN = re.compile(r"\bthe\s+(?:last\s+)?(?:detected\s+)?([a-zA-Z]+)\b", re.IGNORECASE)
+# Accepts "from/on/to/in the left/right" - covers "second dog from the right",
+# "the person on the right", "the person to the left", "the person in the right", etc.
+_DIRECTION_PATTERN = re.compile(r"\b(?:from|on|to|in)\s+the\s+(left|right)\b", re.IGNORECASE)
+# "last" is a rank word like the ordinals, but unlike them it names the highest
+# rank in a direction rather than a fixed number, so it can't live in
+# _ORDINAL_WORDS (whose values are literal integers resolved without knowing
+# how many objects of that label exist).
+_LAST_WORD_PATTERN = re.compile(r"\blast\b", re.IGNORECASE)
 # One keyword per object-scoped operation, used to split a multi-edit message
 # into per-operation clauses (e.g. "...add noise to X and blur Y" has one
 # clause for add_noise, one for blur).
@@ -972,6 +1063,21 @@ def _parse_object_reference_in_clause(clause: str) -> Optional[dict]:
     is far more reliable than asking it to work this out itself."""
     direction_match = _DIRECTION_PATTERN.search(clause)
     direction = direction_match.group(1).lower() if direction_match else None
+
+    if _LAST_WORD_PATTERN.search(clause):
+        label_match = _LABEL_ONLY_PATTERN.search(clause)
+        if label_match:
+            label = _singularize(label_match.group(1))
+            if label not in _NON_OBJECT_LABELS:
+                # "last ... from/in/on the right" means the last object reached
+                # counting from the right, i.e. the leftmost one - and vice
+                # versa. With no direction given, "last" defaults to reading
+                # order, i.e. the rightmost one.
+                return {
+                    "label": label,
+                    "rank_from_left": 1 if direction == "right" else None,
+                    "rank_from_right": 1 if direction != "right" else None,
+                }
 
     ordinal_match = _ORDINAL_LABEL_PATTERN.search(clause)
     if ordinal_match:
@@ -1058,8 +1164,17 @@ def chat(request: ChatRequest):
     newest_message = request.messages[-1] if request.messages else None
     if newest_message is not None and newest_message.role == "user" and newest_message.image_base64:
         # A brand new image was just uploaded this turn - start a fresh edit chain
-        # instead of continuing to build on whatever was edited before it.
+        # instead of continuing to build on whatever was edited before it. Also
+        # drop the persisted S3 copy, or _get_current_image would resurrect the
+        # previous image's edit chain the moment the in-memory dict is empty
+        # (e.g. right after a restart).
         _current_working_image.pop(normalized_chat_id, None)
+        _delete_working_image_from_s3(normalized_chat_id)
+        # Persist the raw upload itself immediately, before any tool has run -
+        # otherwise a crash before the first edit (or before detect_objects,
+        # which is the only other thing that writes this chat's image to S3)
+        # would leave nothing recoverable for this chat in S3 at all.
+        _persist_original_image_to_s3(normalized_chat_id, newest_message.image_base64)
 
     parsed_hints: dict[str, dict] = {}
     if newest_message is not None and newest_message.role == "user":
