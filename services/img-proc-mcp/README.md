@@ -2,7 +2,7 @@
 
 An MCP (Model Context Protocol) server, built with [FastMCP](https://github.com/jlowin/fastmcp), that exposes image manipulation tools over HTTP. The Vision Agent connects to it as an MCP client to process images on demand.
 
-This server is stateless with respect to the *agent's* conversation state (chat history, edit chains, etc. all live in the agent), but it does talk to S3 directly: every tool takes an S3 key pointing at its input image(s), downloads from S3, performs the operation, uploads the result to a new S3 key, and returns just that key - no image bytes are ever sent in the MCP request or response. See "Tools" below for the exact key names.
+This server is stateless with respect to the *agent's* conversation state (chat history, edit chains, etc. all live in the agent), but it does talk to S3 directly: every tool takes an S3 key pointing at its input image(s) AND an `output_s3_key` the caller chooses, downloads the input(s) from S3, performs the operation, uploads the result to `output_s3_key` (overwriting whatever was already there, safe even if it's the same key as an input), and returns that key back. No image bytes are ever sent in the MCP request or response, and this server never invents its own S3 keys - the caller (the agent) is in full control of where results land, which lets it reuse a small, fixed set of scratch keys per chat instead of accumulating a new S3 object on every tool call.
 
 ## Prerequisites
 
@@ -39,17 +39,17 @@ pytest tests/
 
 ## Tools
 
-Every tool downloads its input(s) from S3, applies the operation, uploads the PNG result under a fresh key (`img-proc-mcp/<operation>/<uuid>.png`), and returns that `output_s3_key` as a plain string.
+Every tool downloads its input(s) from S3, applies the operation, uploads the PNG result to the caller-supplied `output_s3_key` (overwritten in place if it already exists), and returns that same key as a plain string.
 
 | Tool | Description |
 |---|---|
-| `blur` | Apply Gaussian blur. Takes `input_s3_key` and an optional `radius` (default `2.0`). |
-| `rotate` | Rotate counter-clockwise by `angle` degrees. Takes `input_s3_key`, `angle`, optional `expand` (default `True`). |
-| `flip` | Flip an image. Takes `input_s3_key`, `direction` (`"horizontal"` default, or `"vertical"`). |
-| `resize` | Resize to an exact `width` x `height` in pixels. Takes `input_s3_key`, `width`, `height`. |
-| `crop` | Crop to the box `(left, top, right, bottom)` in pixels. Takes `input_s3_key`, `left`, `top`, `right`, `bottom`. |
-| `add_noise` | Add salt-and-pepper noise. Takes `input_s3_key`, optional `amount` (default `0.05`, fraction of pixels affected). |
-| `paste` | Paste `region_s3_key` into `base_s3_key` at `(left, top)`, overwriting that area. Used to composite a transformed sub-region back into the full image after an object-scoped edit. |
+| `blur` | Apply Gaussian blur. Takes `input_s3_key`, `output_s3_key`, and an optional `radius` (default `2.0`). |
+| `rotate` | Rotate counter-clockwise by `angle` degrees. Takes `input_s3_key`, `output_s3_key`, `angle`, optional `expand` (default `True`). |
+| `flip` | Flip an image. Takes `input_s3_key`, `output_s3_key`, `direction` (`"horizontal"` default, or `"vertical"`). |
+| `resize` | Resize to an exact `width` x `height` in pixels. Takes `input_s3_key`, `output_s3_key`, `width`, `height`. |
+| `crop` | Crop to the box `(left, top, right, bottom)` in pixels. Takes `input_s3_key`, `output_s3_key`, `left`, `top`, `right`, `bottom`. |
+| `add_noise` | Add salt-and-pepper noise. Takes `input_s3_key`, `output_s3_key`, optional `amount` (default `0.05`, fraction of pixels affected). |
+| `paste` | Paste `region_s3_key` into `base_s3_key` at `(left, top)`, overwriting that area, writing the composited result to `output_s3_key`. Used to composite a transformed sub-region back into the full image after an object-scoped edit - `output_s3_key` is typically the same as `base_s3_key`, so the full image is updated in place. |
 
 ## Talking to the server directly
 
@@ -78,7 +78,9 @@ curl -s -X POST http://localhost:9000/mcp \
   -H "mcp-session-id: <SESSION_ID>" \
   -d '{"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}'
 
-# 3. Call the blur tool - input_s3_key must already exist in AWS_S3_BUCKET
+# 3. Call the blur tool - input_s3_key must already exist in AWS_S3_BUCKET.
+# output_s3_key can be any key you choose, including the same as input_s3_key
+# to blur the image in place.
 curl -s -X POST http://localhost:9000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -89,7 +91,11 @@ curl -s -X POST http://localhost:9000/mcp \
     "method": "tools/call",
     "params": {
       "name": "blur",
-      "arguments": { "input_s3_key": "some-chat-id/scratch/example-input.png", "radius": 2.0 }
+      "arguments": {
+        "input_s3_key": "some-chat-id/scratch/base.png",
+        "output_s3_key": "some-chat-id/scratch/base.png",
+        "radius": 2.0
+      }
     }
   }'
 ```
