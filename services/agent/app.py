@@ -149,14 +149,28 @@ def _get_current_image() -> Optional[str]:
     chat_id = _normalized_chat_id()
     cached = _current_working_image.get(chat_id)
     if cached is not None:
+        logger.info(
+            "_get_current_image: chat_id=%s source=in-memory bytes_len=%d",
+            chat_id, len(cached),
+        )
         return cached
 
     restored = _download_current_image_from_s3(chat_id)
     if restored is not None:
         _current_working_image[chat_id] = restored
+        logger.info(
+            "_get_current_image: chat_id=%s source=s3 key=%s bytes_len=%d",
+            chat_id, _current_image_s3_key(chat_id), len(restored),
+        )
         return restored
 
-    return _current_image_b64.get()
+    from_history = _current_image_b64.get()
+    logger.info(
+        "_get_current_image: chat_id=%s source=%s bytes_len=%s",
+        chat_id, "request-history" if from_history else "none",
+        len(from_history) if from_history else 0,
+    )
+    return from_history
 
 
 # Populated by detect_objects, read by blur_object/rotate_object/flip_object/add_noise_object
@@ -236,12 +250,21 @@ def _download_current_image_from_s3(chat_id: str) -> Optional[str]:
     return _download_bytes_from_s3_as_b64(_current_image_s3_key(chat_id))
 
 
-def _delete_current_image_from_s3(chat_id: str) -> None:
+def _delete_current_image_from_s3(chat_id: str) -> bool:
+    """Returns True if the delete call completed (including a harmless
+    "already doesn't exist" case - S3 DeleteObject is idempotent and does not
+    error on a missing key), False if S3 isn't configured or the call itself
+    raised. Callers log this so a reset that silently failed to take effect
+    is visible instead of assumed to have worked."""
     if not AWS_REGION or not AWS_S3_BUCKET:
-        return
+        return False
     s3_client = boto3.client("s3", region_name=AWS_REGION)
-    with suppress(BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError):
+    try:
         s3_client.delete_object(Bucket=AWS_S3_BUCKET, Key=_current_image_s3_key(chat_id))
+        return True
+    except (BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError):
+        logger.exception("Failed to delete current image from S3 for chat_id=%s", chat_id)
+        return False
 
 
 def _fetch_detections(prediction_id: str) -> list[dict]:
@@ -1529,6 +1552,10 @@ def chat(request: ChatRequest):
     is_new_upload = (
         newest_message is not None and newest_message.role == "user" and bool(newest_message.image_base64)
     )
+    logger.info(
+        "chat: chat_id=%s new_upload_detected=%s message_count=%d",
+        normalized_chat_id, is_new_upload, len(request.messages),
+    )
     if is_new_upload:
         # Normalize EXIF orientation once, right here, before this upload is
         # used for anything (YOLO detection, S3 persistence, edits) - see
@@ -1550,16 +1577,32 @@ def chat(request: ChatRequest):
         # this turn via _current_image_b64 (step 3 of _get_current_image's
         # fallback order) and becomes durable in S3 the moment the first edit
         # or detect_objects call runs.
+        had_cached_working_image = normalized_chat_id in _current_working_image
         _current_working_image.pop(normalized_chat_id, None)
-        _delete_current_image_from_s3(normalized_chat_id)
+        s3_key_deleted = _current_image_s3_key(normalized_chat_id)
+        delete_ok = _delete_current_image_from_s3(normalized_chat_id)
         # Also drop any detections/size from a PREVIOUS image in this same
         # chat_id - otherwise "blur the second dog" on the new image could
         # resolve against boxes measured on the old one if the user asks for
         # an object edit before detect_objects has run again for this upload.
         # (_object_reference_hints_by_chat is handled separately below,
         # re-derived from this turn's own message either way.)
+        had_detections = normalized_chat_id in _detections_by_chat
         _detections_by_chat.pop(normalized_chat_id, None)
         _detection_image_size_by_chat.pop(normalized_chat_id, None)
+        logger.info(
+            "chat: chat_id=%s RESET current_working_image (was_cached=%s) and s3_key=%s "
+            "(delete_ok=%s) and detections (had_detections=%s)",
+            normalized_chat_id, had_cached_working_image, s3_key_deleted, delete_ok, had_detections,
+        )
+    else:
+        current_image_source = (
+            "in-memory" if normalized_chat_id in _current_working_image else "s3-or-history"
+        )
+        logger.info(
+            "chat: chat_id=%s no new upload this turn, continuing edit chain from %s",
+            normalized_chat_id, current_image_source,
+        )
 
     parsed_hints: dict[str, dict] = {}
     if newest_message is not None and newest_message.role == "user":
