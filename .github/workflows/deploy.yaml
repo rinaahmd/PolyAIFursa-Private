@@ -127,6 +127,7 @@ jobs:
               echo "YOLO_IMAGE_TAG=${{ github.sha }}" >> .env
             fi
 
+            docker compose -f docker-compose.yml rm -sf yolo || true
             docker compose -f docker-compose.yml pull yolo
             docker compose -f docker-compose.yml up -d --no-deps yolo
 
