@@ -1,3 +1,4 @@
+import asyncio
 import json
 import base64
 import re
@@ -321,14 +322,34 @@ def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
     assert captured["uploaded_key"] == expected_key
 
 
-def test_blur_image_calls_mcp_and_hides_image_bytes_from_tool_output(monkeypatch):
+def test_blur_image_uploads_input_to_s3_calls_mcp_with_key_and_hides_image_bytes_from_tool_output(monkeypatch):
+    s3_store: dict[str, bytes] = {}
+
+    def fake_upload(data, s3_key, content_type="image/jpeg"):
+        s3_store[s3_key] = data
+
+    def fake_download(s3_key):
+        return s3_store.get(s3_key)
+
+    captured_call = {}
+
     async def fake_call_mcp_tool(tool_name, arguments):
         assert tool_name == "blur"
-        assert arguments == {"image_b64": "aW1hZ2U=", "radius": 3.0}
-        return "Ymx1cnJlZC1pbWFnZQ=="
+        captured_call["tool_name"] = tool_name
+        captured_call["arguments"] = arguments
+        assert "image_b64" not in arguments  # no raw bytes cross the MCP call
+        assert arguments["radius"] == 3.0
+        input_key = arguments["input_s3_key"]
+        # Simulate the MCP server: download input, "process", upload result under a new key.
+        s3_store["mcp-output.png"] = s3_store[input_key] + b"-blurred"
+        return "mcp-output.png"
 
+    monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", fake_upload)
+    monkeypatch.setattr(agent_app, "_download_bytes_from_s3", fake_download)
     monkeypatch.setattr(agent_app, "_call_mcp_tool", fake_call_mcp_tool)
     monkeypatch.setattr(agent_app, "_processed_images", {})
+    monkeypatch.setattr(agent_app, "_persist_current_image_to_s3", lambda *a, **k: None)
+    monkeypatch.setattr(agent_app, "_persist_operation_image_to_s3", lambda *a, **k: None)
 
     image_token = agent_app._current_image_b64.set("aW1hZ2U=")
     try:
@@ -340,10 +361,12 @@ def test_blur_image_calls_mcp_and_hides_image_bytes_from_tool_output(monkeypatch
     assert payload["status"] == "ok"
     assert payload["operation"] == "blur"
     assert payload["radius"] == 3.0
-    assert "Ymx1cnJlZC1pbWFnZQ==" not in raw
+    assert "image_b64" not in raw
+    assert captured_call["arguments"]["input_s3_key"].endswith("-input.png")
 
     operation_id = payload["operation_id"]
-    assert agent_app._processed_images[operation_id] == "Ymx1cnJlZC1pbWFnZQ=="
+    expected_result_b64 = base64.b64encode(b"image-blurred").decode("utf-8")
+    assert agent_app._processed_images[operation_id] == expected_result_b64
 
 
 def test_blur_image_returns_error_when_no_image_provided():
@@ -357,6 +380,8 @@ def test_blur_image_returns_error_when_no_image_provided():
 
 
 def test_blur_image_returns_error_when_mcp_call_fails(monkeypatch):
+    monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", lambda *a, **k: None)
+
     async def failing_call_mcp_tool(tool_name, arguments):
         raise RuntimeError("img-proc-mcp unreachable")
 
@@ -371,6 +396,59 @@ def test_blur_image_returns_error_when_mcp_call_fails(monkeypatch):
     payload = json.loads(raw)
     assert "error" in payload
     assert "img-proc-mcp unreachable" in payload["error"]
+
+
+def test_blur_image_returns_error_when_mcp_output_key_unreadable(monkeypatch):
+    monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", lambda *a, **k: None)
+    monkeypatch.setattr(agent_app, "_download_bytes_from_s3", lambda s3_key: None)
+
+    async def fake_call_mcp_tool(tool_name, arguments):
+        return "some-output-key.png"
+
+    monkeypatch.setattr(agent_app, "_call_mcp_tool", fake_call_mcp_tool)
+
+    image_token = agent_app._current_image_b64.set("aW1hZ2U=")
+    try:
+        raw = agent_app.blur_image.invoke({})
+    finally:
+        agent_app._current_image_b64.reset(image_token)
+
+    payload = json.loads(raw)
+    assert "error" in payload
+    assert "did not return a readable result" in payload["error"]
+
+
+def test_call_mcp_object_op_uses_s3_keys_for_crop_operation_paste(monkeypatch):
+    calls = []
+
+    async def fake_call_mcp_tool(tool_name, arguments):
+        calls.append((tool_name, arguments))
+        if tool_name == "crop":
+            return "region-key.png"
+        if tool_name == "blur":
+            return "transformed-region-key.png"
+        if tool_name == "paste":
+            return "final-key.png"
+        raise AssertionError(f"unexpected tool {tool_name}")
+
+    monkeypatch.setattr(agent_app, "_call_mcp_tool", fake_call_mcp_tool)
+
+    result = asyncio.run(
+        agent_app._call_mcp_object_op(
+            "blur", {"radius": 2.0}, "chat-1", "input-key.png", [10.0, 20.0, 30.0, 40.0]
+        )
+    )
+
+    assert result == "final-key.png"
+    assert calls[0] == (
+        "crop",
+        {"input_s3_key": "input-key.png", "left": 10, "top": 20, "right": 30, "bottom": 40},
+    )
+    assert calls[1] == ("blur", {"input_s3_key": "region-key.png", "radius": 2.0})
+    assert calls[2] == (
+        "paste",
+        {"base_s3_key": "input-key.png", "region_s3_key": "transformed-region-key.png", "left": 10, "top": 20},
+    )
 
 
 def test_run_agent_surfaces_processed_image_from_blur_tool(monkeypatch):

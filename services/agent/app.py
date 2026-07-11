@@ -319,6 +319,11 @@ def _extract_mcp_text(result: Any) -> str:
 
 
 async def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
+    """Call an img-proc-mcp tool. All tools now take S3 key(s) in `arguments`
+    (e.g. input_s3_key, or base_s3_key/region_s3_key for paste) and return a
+    plain output_s3_key string - no image bytes cross the agent<->MCP call
+    itself. MCP downloads the input(s) from S3, does the pixel op, uploads
+    the result under a fresh key, and hands back only that key."""
     client = MultiServerMCPClient(
         {
             "img-proc": {
@@ -341,14 +346,28 @@ async def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
 _processed_images: dict[str, str] = {}
 
 
-async def _call_mcp_object_op(operation: str, arguments: dict, image_b64: str, box: list) -> str:
+def _scratch_s3_key(chat_id: str, label: str) -> str:
+    """Key for an image staged in S3 purely to hand off to img-proc-mcp (an
+    upload, a crop, an operation result) - distinct from the durable
+    <chat_id>/current.png and <chat_id>/operations/... keys, which only ever
+    hold a chat's actual state, not MCP call scratch data."""
+    return f"{chat_id}/scratch/{uuid.uuid4()}-{label}.png"
+
+
+async def _call_mcp_object_op(operation: str, arguments: dict, chat_id: str, input_s3_key: str, box: list) -> str:
+    """crop -> operation -> paste, all via S3 keys: MCP crops just the
+    bounding-box region out of the full image (so only that small region -
+    not the whole image - ever gets downloaded again for the blur/rotate/etc
+    step), transforms it, then pastes the transformed region back into the
+    full image. Returns the S3 key of the final, full-size composited image."""
     left, top, right, bottom = (int(round(v)) for v in box)
-    region_b64 = await _call_mcp_tool(
-        "crop", {"image_b64": image_b64, "left": left, "top": top, "right": right, "bottom": bottom}
+    region_s3_key = await _call_mcp_tool(
+        "crop", {"input_s3_key": input_s3_key, "left": left, "top": top, "right": right, "bottom": bottom}
     )
-    transformed_region_b64 = await _call_mcp_tool(operation, {"image_b64": region_b64, **arguments})
+    transformed_region_s3_key = await _call_mcp_tool(operation, {"input_s3_key": region_s3_key, **arguments})
     return await _call_mcp_tool(
-        "paste", {"base_image_b64": image_b64, "region_b64": transformed_region_b64, "left": left, "top": top}
+        "paste",
+        {"base_s3_key": input_s3_key, "region_s3_key": transformed_region_s3_key, "left": left, "top": top},
     )
 
 
@@ -404,10 +423,22 @@ def _run_image_op(
             return json.dumps({"error": error})
 
     try:
+        # Stage the current image in S3 so img-proc-mcp can pull it by key -
+        # the agent<->MCP call itself carries only that key, never the bytes.
+        input_s3_key = _scratch_s3_key(chat_id, "input")
+        _upload_bytes_to_s3(base64.b64decode(image_b64), input_s3_key, content_type="image/png")
+
         if box is None:
-            result_b64 = asyncio.run(_call_mcp_tool(operation, {"image_b64": image_b64, **arguments}))
+            output_s3_key = asyncio.run(_call_mcp_tool(operation, {"input_s3_key": input_s3_key, **arguments}))
         else:
-            result_b64 = asyncio.run(_call_mcp_object_op(operation, arguments, image_b64, box))
+            output_s3_key = asyncio.run(
+                _call_mcp_object_op(operation, arguments, chat_id, input_s3_key, box)
+            )
+
+        result_bytes = _download_bytes_from_s3(output_s3_key)
+        if result_bytes is None:
+            return json.dumps({"error": f"img-proc-mcp did not return a readable result for {operation}."})
+        result_b64 = base64.b64encode(result_bytes).decode("utf-8")
     except Exception as exc:
         logger.exception("%s: failed to call img-proc MCP server", operation)
         return json.dumps({"error": f"Failed to {operation} image: {exc}"})
