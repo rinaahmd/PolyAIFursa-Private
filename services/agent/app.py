@@ -960,23 +960,110 @@ def _fetch_annotated_image(prediction_id: str) -> Optional[str]:
 
 
 
+class ContentBlockedError(Exception):
+    """Raised when Bedrock refused to produce a usable response for reasons
+    outside this code's control - either its own in-band content filter
+    (a normal 200 response whose text says the reply was blocked, with zero
+    tool calls) or a thrown ClientError (a real Guardrail intervention,
+    ValidationException, etc). Carries a `block_kind` used to pick the
+    frontend-facing message and to decide whether the deterministic fallback
+    parser should take over."""
+
+    def __init__(self, block_kind: str, detail: str, tools_called: Optional[list[str]] = None):
+        self.block_kind = block_kind  # "input_image" | "text_prompt" | "model_output" | "guardrail" | "other"
+        self.detail = detail
+        # Tools the agent had already run THIS turn before the block happened -
+        # confirms whether blocking occurred before or after tool execution.
+        self.tools_called = tools_called or []
+        super().__init__(detail)
+
+
+# Safe, specific messages shown to the user - never includes exc.detail
+# (which may echo back parts of the AWS error message) so nothing from the
+# provider's internal error text reaches the frontend unfiltered.
+_BLOCK_KIND_MESSAGES = {
+    "input_image": "The provider blocked the uploaded image.",
+    "text_prompt": "The provider blocked the text instruction.",
+    "model_output": "The provider blocked its own generated response. Please try again or rephrase your request.",
+    "guardrail": "A configured content safety guardrail blocked this request.",
+    "other": "The provider blocked this request for a content-safety reason.",
+}
+
+
+# AWS error codes/message substrings that indicate the request was rejected
+# for image content specifically, vs. text/prompt content, vs. a configured
+# Guardrail. Bedrock does not always give a clean single field for this, so
+# classification is necessarily best-effort pattern matching on the message.
+_IMAGE_BLOCK_MARKERS = ("image", "vision", "unsafe image", "media type")
+_GUARDRAIL_MARKERS = ("guardrail",)
+_PROMPT_BLOCK_MARKERS = ("content policy", "content filter", "harmful", "prompt")
+
+
+def _classify_client_error(exc: ClientError) -> ContentBlockedError:
+    """Turn a botocore ClientError from a Bedrock call into a classified
+    ContentBlockedError, without ever including the request's image bytes
+    (this only ever looks at `exc.response['Error']`, which is Bedrock's own
+    short message - it does not echo request bodies/credentials back)."""
+    error = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
+    error_code = error.get("Code", "Unknown")
+    error_message = error.get("Message", str(exc))
+    request_id = exc.response.get("ResponseMetadata", {}).get("RequestId") if hasattr(exc, "response") else None
+
+    lower_message = error_message.lower()
+    if any(marker in lower_message for marker in _GUARDRAIL_MARKERS):
+        block_kind = "guardrail"
+    elif any(marker in lower_message for marker in _IMAGE_BLOCK_MARKERS):
+        block_kind = "input_image"
+    elif error_code == "ValidationException" and any(marker in lower_message for marker in _PROMPT_BLOCK_MARKERS):
+        block_kind = "text_prompt"
+    else:
+        block_kind = "other"
+
+    logger.error(
+        "Bedrock ClientError: type=%s aws_error_code=%s request_id=%s block_kind=%s message=%s",
+        type(exc).__name__, error_code, request_id, block_kind, error_message,
+    )
+    return ContentBlockedError(block_kind, f"{error_code}: {error_message}")
+
+
 def _invoke_with_content_filter_retry(llm_with_tools, messages: list, max_retries: int = 4) -> AIMessage:
     """Bedrock's own content-safety layer has been observed to block a
     response to some multi-step edit requests intermittently - the exact
     same messages can succeed on a retry a moment later. Retry a few times
     before giving up, since this is nondeterministic and out of this code's
-    control (it isn't something our prompt or tool design can fix)."""
-    response = llm_with_tools.invoke(messages)
-    attempts = 1
-    while (
-        not response.tool_calls
-        and "blocked by our content filters" in _stringify_content(response.content).lower()
-        and attempts <= max_retries
-    ):
-        logger.warning("LLM response blocked by content filters, retrying (attempt %d/%d)", attempts, max_retries)
-        response = llm_with_tools.invoke(messages)
+    control (it isn't something our prompt or tool design can fix).
+
+    Two distinct failure shapes are handled:
+    - In-band refusal: a normal (200) AIMessage whose text says the reply was
+      blocked, with response_metadata['stopReason'] == 'content_filtered' (or
+      the older text-matching fallback for responses that don't set it) and
+      zero tool_calls. Retried up to max_retries times.
+    - A thrown ClientError (real Guardrail intervention, ValidationException,
+      etc): never silently retried into an unhandled 500 - classified and
+      re-raised as ContentBlockedError so the caller can log full AWS detail
+      and fall back to the deterministic parser."""
+    attempts = 0
+    while True:
         attempts += 1
-    return response
+        try:
+            response = llm_with_tools.invoke(messages)
+        except ClientError as exc:
+            raise _classify_client_error(exc) from exc
+
+        stop_reason = response.response_metadata.get("stopReason") if response.response_metadata else None
+        is_content_filtered = stop_reason in ("content_filtered", "guardrail_intervened") or (
+            "blocked by our content filters" in _stringify_content(response.content).lower()
+        )
+        if response.tool_calls or not is_content_filtered:
+            return response
+        if attempts > max_retries:
+            block_kind = "guardrail" if stop_reason == "guardrail_intervened" else "model_output"
+            logger.error(
+                "Bedrock in-band content block after %d attempts: stop_reason=%s block_kind=%s",
+                attempts, stop_reason, block_kind,
+            )
+            raise ContentBlockedError(block_kind, f"stopReason={stop_reason}")
+        logger.warning("LLM response blocked by content filters, retrying (attempt %d/%d)", attempts, max_retries)
 
 
 def run_agent(history: list, max_iterations: int = 10) -> dict:
@@ -1004,7 +1091,19 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
 
     for _ in range(max_iterations):
         iterations += 1
-        response: AIMessage = _invoke_with_content_filter_retry(active_llm_with_tools, messages)
+        try:
+            response: AIMessage = _invoke_with_content_filter_retry(active_llm_with_tools, messages)
+        except ContentBlockedError as exc:
+            # Attach the tools already run THIS turn before re-raising, so the
+            # caller (chat()) can log/decide fallback eligibility based on
+            # whether the block happened before or after any tool executed.
+            exc.tools_called = list(tools_called)
+            logger.error(
+                "run_agent: content block after %d iteration(s), tools_called_before_block=%s, block_kind=%s",
+                iterations, tools_called, exc.block_kind,
+            )
+            raise
+
         usage = _extract_usage_metadata(response)
         total_input_tokens = _sum_optional(total_input_tokens, usage["input"])
         total_output_tokens = _sum_optional(total_output_tokens, usage["output"])
@@ -1022,16 +1121,6 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         # No tool calls, the model produced its final answer
         if not response.tool_calls:
             final_response = _stringify_content(response.content)
-            if "blocked by our content filters" in final_response.lower():
-                # This is the model provider's own safety layer, triggered
-                # intermittently (observed to vary between identical, repeated
-                # requests) - not something this code can control. Give the
-                # user something actionable instead of the raw filter string.
-                final_response = (
-                    "This request was blocked by the AI provider's content safety filters. "
-                    "This can happen intermittently, especially with multi-step edit requests - "
-                    "please try again, or rephrase your request."
-                )
             break
 
         # Execute every tool the model requested
@@ -1275,6 +1364,142 @@ def _parse_object_reference_hints(text: str) -> dict[str, dict]:
     return hints
 
 
+_WHOLE_IMAGE_TOOL_BY_OPERATION = {
+    "blur": blur_image,
+    "flip": flip_image,
+    "add_noise": add_noise_image,
+}
+_OBJECT_TOOL_BY_OPERATION = {
+    "blur": blur_object,
+    "flip": flip_object,
+    "add_noise": add_noise_object,
+}
+
+
+def _extract_clause_number(clause: str) -> Optional[float]:
+    """Pull the first decimal/integer literal out of a clause, e.g. "noise
+    0.6" -> 0.6, "blur radius 3" -> 3.0. Returns None when the clause names
+    no number, so the tool's own default (radius=2.0, amount=0.05) applies -
+    same as when the LLM path omits the argument."""
+    match = re.search(r"\b\d+(?:\.\d+)?\b", clause)
+    return float(match.group()) if match else None
+
+
+def _run_deterministic_fallback(chat_id: str, text: str) -> dict:
+    """Parse flip/blur/add_noise clauses out of `text` with the same plain-Python
+    parsing already used to override the LLM's own tool arguments
+    (_parse_object_reference_hints/_parse_object_reference_in_clause), and call
+    the matching blur_object/flip_object/add_noise_object (or the whole-image
+    variant, if the clause names no object) tool functions directly - no LLM
+    call at all. Used only when Bedrock has refused to produce a usable
+    response; this performs exactly the operations the user's own words
+    specify, nothing more, nothing invented.
+
+    rotate_image/rotate_object/resize_image/crop_image are intentionally not
+    covered - the existing regex parser only recognizes blur/flip/add_noise
+    keywords (_OPERATION_KEYWORDS), matching the tools this fallback exists
+    for per the task."""
+    chat_token = _current_chat_id.set(chat_id)
+    try:
+        clauses = re.split(r"\band\b", text, flags=re.IGNORECASE)
+        tools_called: list[str] = []
+        processed_image: Optional[str] = None
+        performed: list[str] = []
+        errors: list[str] = []
+        needs_detection = False
+
+        parsed_clauses: list[tuple[str, Optional[dict], Optional[float]]] = []
+        for clause in clauses:
+            clause_lower = clause.lower()
+            operation = next(
+                (op for op, keywords in _OPERATION_KEYWORDS.items() if any(k in clause_lower for k in keywords)),
+                None,
+            )
+            if operation is None:
+                continue
+            reference = _parse_object_reference_in_clause(clause)
+            number = _extract_clause_number(clause)
+            parsed_clauses.append((operation, reference, number))
+            if reference is not None:
+                needs_detection = True
+
+        if not parsed_clauses:
+            return {
+                "response": "The provider blocked this request and no supported flip/blur/noise "
+                "instruction could be parsed from it automatically. Please try again or rephrase.",
+                "tools_called": [],
+                "processed_image": None,
+                "prediction_id": None,
+                "annotated_image": None,
+            }
+
+        prediction_id: Optional[str] = None
+        annotated_image: Optional[str] = None
+        if needs_detection:
+            tools_called.append(detect_objects.name)
+            raw = detect_objects.invoke({})
+            parsed = _parse_tool_json(raw)
+            if parsed:
+                candidate_id = parsed.get("prediction_uid")
+                if isinstance(candidate_id, str) and candidate_id:
+                    prediction_id = candidate_id
+                    annotated_image = _fetch_annotated_image(candidate_id)
+
+        for operation, reference, number in parsed_clauses:
+            if reference is not None:
+                tool_fn = _OBJECT_TOOL_BY_OPERATION[operation]
+                kwargs = {
+                    "label": reference["label"],
+                    "rank_from_left": reference["rank_from_left"],
+                    "rank_from_right": reference["rank_from_right"],
+                }
+            else:
+                tool_fn = _WHOLE_IMAGE_TOOL_BY_OPERATION[operation]
+                kwargs = {}
+
+            if operation == "blur" and number is not None:
+                kwargs["radius"] = number
+            elif operation == "add_noise" and number is not None:
+                kwargs["amount"] = number
+
+            tools_called.append(tool_fn.name)
+            raw = tool_fn.invoke(kwargs)
+            parsed = _parse_tool_json(raw)
+            if parsed and "error" not in parsed:
+                operation_id = parsed.get("operation_id")
+                if isinstance(operation_id, str) and operation_id:
+                    processed_image = _processed_images.pop(operation_id, processed_image)
+                performed.append(operation)
+            elif parsed:
+                errors.append(f"{operation}: {parsed['error']}")
+
+        if performed and not errors:
+            response_text = (
+                "The AI provider blocked its own response for this request, so it was completed "
+                f"deterministically instead: {', '.join(performed)}."
+            )
+        elif performed:
+            response_text = (
+                f"The AI provider blocked its own response. Completed: {', '.join(performed)}. "
+                f"Failed: {'; '.join(errors)}."
+            )
+        else:
+            response_text = (
+                f"The AI provider blocked its own response, and the fallback could not complete "
+                f"any operation: {'; '.join(errors)}."
+            )
+
+        return {
+            "response": response_text,
+            "tools_called": tools_called,
+            "processed_image": processed_image,
+            "prediction_id": prediction_id,
+            "annotated_image": annotated_image,
+        }
+    finally:
+        _current_chat_id.reset(chat_token)
+
+
 def _reorder_clauses_to_avoid_content_filter(text: str) -> str:
     """Observed empirically: a message with several edit clauses ordered as
     "add noise to X and flip Y and blur Z" reliably triggers Bedrock's own
@@ -1375,6 +1600,47 @@ def chat(request: ChatRequest):
     chat_token = _current_chat_id.set(request.chat_id)
     try:
         return ChatResponse(**run_agent(lc_messages))
+    except ContentBlockedError as exc:
+        logger.error(
+            "chat: Bedrock blocked chat_id=%s block_kind=%s tools_called_before_block=%s detail=%s",
+            normalized_chat_id, exc.block_kind, exc.tools_called, exc.detail,
+        )
+        fallback_result: Optional[dict] = None
+        # Only text/model-output blocks are eligible for the deterministic
+        # fallback - an input-image block means Bedrock rejected the image
+        # itself, which the fallback can't route around (it still needs YOLO
+        # to have a usable image), and "other"/unclassified errors are kept
+        # generic rather than guessed at.
+        if exc.block_kind in ("text_prompt", "model_output") and newest_message is not None:
+            try:
+                fallback_result = _run_deterministic_fallback(normalized_chat_id, newest_message.content)
+            except Exception:
+                logger.exception("chat: deterministic fallback itself failed for chat_id=%s", normalized_chat_id)
+
+        if fallback_result is not None:
+            return ChatResponse(
+                response=fallback_result["response"],
+                prediction_id=fallback_result["prediction_id"],
+                annotated_image=fallback_result["annotated_image"],
+                processed_image=fallback_result["processed_image"],
+                agent_loop_time_s=0.0,
+                iterations=0,
+                tools_called=fallback_result["tools_called"],
+                context_limit_exceeded=False,
+                tokens_used=TokenUsage(),
+            )
+
+        return ChatResponse(
+            response=_BLOCK_KIND_MESSAGES.get(exc.block_kind, _BLOCK_KIND_MESSAGES["other"]),
+            prediction_id=None,
+            annotated_image=None,
+            processed_image=None,
+            agent_loop_time_s=0.0,
+            iterations=0,
+            tools_called=exc.tools_called,
+            context_limit_exceeded=False,
+            tokens_used=TokenUsage(),
+        )
     finally:
         _current_chat_id.reset(chat_token)
         _current_image_b64.reset(image_token)
