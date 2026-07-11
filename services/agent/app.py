@@ -350,9 +350,9 @@ def detect_objects() -> str:
         _detection_image_size_by_chat.pop(chat_id, None)
 
     logger.info(
-        "detect_objects chat_id=%s prediction_id=%s image_size=%sx%s detections=%d raw_boxes=%s",
+        "detect_objects chat_id=%s prediction_id=%s image_size=%sx%s detections=%d labels_scores_boxes=%s",
         chat_id, prediction_id, image_width, image_height, len(detections),
-        [d["box"] for d in detections],
+        [(d["label"], d["score"], d["box"]) for d in detections],
     )
 
     result["detections"] = detections
