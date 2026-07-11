@@ -1570,30 +1570,35 @@ def chat(request: ChatRequest):
 
     if is_new_upload:
         # A brand new image was just uploaded this turn - start a fresh edit chain
-        # instead of continuing to build on whatever was edited before it. Also
-        # drop the persisted S3 copy, or _get_current_image would resurrect the
-        # previous image's edit chain the moment the in-memory dict is empty
-        # (e.g. right after a restart). The upload itself is still available
-        # this turn via _current_image_b64 (step 3 of _get_current_image's
-        # fallback order) and becomes durable in S3 the moment the first edit
-        # or detect_objects call runs.
+        # instead of continuing to build on whatever was edited before it.
+        #
+        # This OVERWRITES <chat_id>/current.png with the new upload's own bytes
+        # (via _persist_current_image_to_s3, which only needs s3:PutObject)
+        # rather than trying to DELETE the old object first. DeleteObject is a
+        # separate IAM permission from PutObject - on this deployment the
+        # role's policy only grants PutObject, so a delete-then-rely-on-absence
+        # approach silently left the previous chat's result in place at
+        # <chat_id>/current.png forever (confirmed live: DeleteObject calls
+        # were failing with AccessDenied, and the NEXT turn's _get_current_image
+        # would then read that stale object back from S3, before ever falling
+        # through to this request's own upload). Overwriting sidesteps the
+        # permission entirely - PutObject always replaces existing content.
         had_cached_working_image = normalized_chat_id in _current_working_image
-        _current_working_image.pop(normalized_chat_id, None)
-        s3_key_deleted = _current_image_s3_key(normalized_chat_id)
-        delete_ok = _delete_current_image_from_s3(normalized_chat_id)
-        # Also drop any detections/size from a PREVIOUS image in this same
-        # chat_id - otherwise "blur the second dog" on the new image could
-        # resolve against boxes measured on the old one if the user asks for
-        # an object edit before detect_objects has run again for this upload.
-        # (_object_reference_hints_by_chat is handled separately below,
-        # re-derived from this turn's own message either way.)
+        _current_working_image[normalized_chat_id] = newest_message.image_base64
+        _persist_current_image_to_s3(normalized_chat_id, newest_message.image_base64)
+        # Also drop any detections/size/prediction state from a PREVIOUS image
+        # in this same chat_id - otherwise "blur the second dog" on the new
+        # image could resolve against boxes measured on the old one if the
+        # user asks for an object edit before detect_objects has run again
+        # for this upload. (_object_reference_hints_by_chat is handled
+        # separately below, re-derived from this turn's own message either way.)
         had_detections = normalized_chat_id in _detections_by_chat
         _detections_by_chat.pop(normalized_chat_id, None)
         _detection_image_size_by_chat.pop(normalized_chat_id, None)
         logger.info(
-            "chat: chat_id=%s RESET current_working_image (was_cached=%s) and s3_key=%s "
-            "(delete_ok=%s) and detections (had_detections=%s)",
-            normalized_chat_id, had_cached_working_image, s3_key_deleted, delete_ok, had_detections,
+            "chat: chat_id=%s RESET current_working_image (was_cached=%s) to the new upload, "
+            "overwrote s3_key=%s, cleared detections (had_detections=%s)",
+            normalized_chat_id, had_cached_working_image, _current_image_s3_key(normalized_chat_id), had_detections,
         )
     else:
         current_image_source = (

@@ -266,12 +266,13 @@ def test_new_upload_in_same_chat_clears_previous_detections_and_size(monkeypatch
     )
     monkeypatch.setattr(agent_app, "_detection_image_size_by_chat", {"chat-x": (100, 100)})
     monkeypatch.setattr(agent_app, "_current_working_image", {"chat-x": "stale-b64"})
-    monkeypatch.setattr(agent_app, "_delete_current_image_from_s3", lambda chat_id: None)
+    monkeypatch.setattr(agent_app, "_persist_current_image_to_s3", lambda chat_id, image_b64: None)
     monkeypatch.setattr(agent_app, "_normalize_image_orientation", lambda b64: b64)
 
+    new_upload_b64 = _png_b64(10, 10)
     request = agent_app.ChatRequest(
         messages=[
-            agent_app.ChatMessage(role="user", content="here's a new image", image_base64=_png_b64(10, 10)),
+            agent_app.ChatMessage(role="user", content="here's a new image", image_base64=new_upload_b64),
         ],
         chat_id="chat-x",
     )
@@ -287,4 +288,52 @@ def test_new_upload_in_same_chat_clears_previous_detections_and_size(monkeypatch
 
     assert "chat-x" not in agent_app._detections_by_chat
     assert "chat-x" not in agent_app._detection_image_size_by_chat
+    # The working image must be the NEW upload, not merely absent - relying on
+    # absence-then-fallback is what let a failed S3 delete (missing
+    # s3:DeleteObject IAM permission, observed live) leave the previous
+    # chat's result in place. Setting it directly here means the reset can't
+    # be undone by an S3 permission problem.
+    assert agent_app._current_working_image["chat-x"] == new_upload_b64
+
+
+def test_new_upload_does_not_depend_on_s3_delete_succeeding(monkeypatch):
+    """Regression test for the exact bug reported live: upload A, edit it,
+    upload B in the same chat, then a plain follow-up request must operate
+    on B - even if the S3 delete-based reset would have failed (simulated
+    here by making _delete_current_image_from_s3 always fail/unused), because
+    the fix no longer depends on delete succeeding at all."""
+    monkeypatch.setattr(
+        agent_app, "_delete_current_image_from_s3",
+        lambda chat_id: (_ for _ in ()).throw(AssertionError("delete should not be called by the reset path")),
+    )
+    persisted = {}
+    monkeypatch.setattr(
+        agent_app, "_persist_current_image_to_s3",
+        lambda chat_id, image_b64: persisted.__setitem__(chat_id, image_b64),
+    )
+    monkeypatch.setattr(agent_app, "_normalize_image_orientation", lambda b64: b64)
+    monkeypatch.setattr(agent_app, "_current_working_image", {"chat-y": "image-A-flipped-result"})
+    monkeypatch.setattr(agent_app, "_detections_by_chat", {"chat-y": [{"label": "cat"}]})
+    monkeypatch.setattr(agent_app, "_detection_image_size_by_chat", {"chat-y": (660, 660)})
+
+    image_b_b64 = _png_b64(50, 50)
+    request = agent_app.ChatRequest(
+        messages=[
+            agent_app.ChatMessage(role="user", content="here is image B", image_base64=image_b_b64),
+        ],
+        chat_id="chat-y",
+    )
+
+    fake_response = {
+        "response": "ok", "prediction_id": None, "annotated_image": None, "processed_image": None,
+        "agent_loop_time_s": 0.0, "iterations": 1, "tools_called": [], "context_limit_exceeded": False,
+        "tokens_used": {"input": None, "output": None, "total": None},
+    }
+    monkeypatch.setattr(agent_app, "run_agent", lambda *a, **k: fake_response)
+
+    agent_app.chat(request)
+
+    assert agent_app._current_working_image["chat-y"] == image_b_b64
+    assert persisted["chat-y"] == image_b_b64
+    assert "chat-y" not in agent_app._detections_by_chat
     assert "chat-x" not in agent_app._current_working_image
