@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import io
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from typing import Any, Optional
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError
 from dotenv import load_dotenv
+from PIL import Image, ImageOps
 load_dotenv()
 
 logging.basicConfig(
@@ -70,6 +72,31 @@ def _normalized_chat_id() -> str:
     return (_current_chat_id.get() or "chat").strip() or "chat"
 
 
+def _normalize_image_orientation(image_b64: str) -> str:
+    """Bake any EXIF orientation into the pixel grid once, right when an
+    upload first enters the system, and re-encode as PNG (which carries no
+    orientation-flag ambiguity). Every later consumer - YOLO's own detection
+    call, the agent's S3 persistence, img-proc-mcp's crop/paste - then agrees
+    on the same pixel grid, so a box measured by one of them lands on the
+    right region when used by another. Without this, a portrait phone photo
+    (stored as wide pixels + a "rotate on display" EXIF tag) could have YOLO
+    auto-rotate it internally for detection while the edit pipeline used the
+    raw, un-rotated pixels - producing boxes that don't match the image being
+    edited at all. Returns the input unchanged (rather than raising) if it
+    isn't valid image bytes; the actual decode error surfaces later at the
+    point that already handles it (e.g. detect_objects)."""
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            normalized = ImageOps.exif_transpose(image) or image
+            buffer = io.BytesIO()
+            normalized.save(buffer, format="PNG")
+            return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    except Exception:
+        logger.exception("Failed to normalize image orientation; using the upload as-is")
+        return image_b64
+
+
 # The result of the most recent edit for each chat, so edits build on each other
 # (blur, then rotate, rotates the blurred version) instead of every tool always
 # starting over from the original upload. Keyed by chat_id, not a ContextVar, for
@@ -94,8 +121,19 @@ def _current_image_s3_key(chat_id: str) -> str:
     return f"{chat_id}/current.png"
 
 
-def _operation_image_s3_key(chat_id: str, operation_id: str, operation: str) -> str:
-    return f"{chat_id}/operations/{operation_id}-{operation}.png"
+def _scratch_base_s3_key(chat_id: str) -> str:
+    """One stable key per chat for staging 'the full image being worked on'
+    for an MCP call, and one below for 'the region in flight' during an
+    object-scoped crop -> operation -> paste chain. Reused (overwritten) on
+    every edit and every step, rather than a fresh S3 object per tool call -
+    the only thing that needs to persist between chat turns is
+    <chat_id>/current.png; these are purely in-flight handoff data for the
+    current request."""
+    return f"{chat_id}/scratch/base.png"
+
+
+def _scratch_region_s3_key(chat_id: str) -> str:
+    return f"{chat_id}/scratch/region.png"
 
 
 def _get_current_image() -> Optional[str]:
@@ -125,6 +163,22 @@ def _get_current_image() -> Optional[str]:
 # to resolve "the second dog" to actual pixel coordinates without asking the LLM to copy box
 # coordinates by hand. Keyed by chat_id for the same reason as _current_working_image above.
 _detections_by_chat: dict[str, list[dict]] = {}
+
+# The (width, height) YOLO measured its boxes against for each chat's most
+# recent detect_objects call. Read by _resolve_object_box to scale a box if
+# the image being edited (e.g. after a resize, or a re-upload with different
+# pixel dimensions than what YOLO saw) no longer matches that size - without
+# this, a box computed for one image size would land on the wrong region, or
+# an oversized/undersized one, once applied to a differently-sized image.
+_detection_image_size_by_chat: dict[str, tuple[int, int]] = {}
+
+
+def _image_size(image_b64: str) -> Optional[tuple[int, int]]:
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(image_b64))) as image:
+            return image.size
+    except Exception:
+        return None
 
 
 def _upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "image/jpeg") -> None:
@@ -169,15 +223,6 @@ def _persist_current_image_to_s3(chat_id: str, image_b64: str) -> None:
     authoritative for the rest of this process's lifetime regardless of
     whether this S3 write succeeds."""
     _persist_png_to_s3(image_b64, _current_image_s3_key(chat_id), "current image")
-
-
-def _persist_operation_image_to_s3(chat_id: str, operation_id: str, operation: str, image_b64: str) -> None:
-    """Archive a copy of the result of each individual edit, so the edit
-    history for a chat is recoverable from S3 even though only the latest
-    state is kept at <chat_id>/current.png."""
-    _persist_png_to_s3(
-        image_b64, _operation_image_s3_key(chat_id, operation_id, operation), f"{operation} operation result"
-    )
 
 
 def _download_bytes_from_s3_as_b64(s3_key: str) -> Optional[str]:
@@ -296,6 +341,20 @@ def detect_objects() -> str:
 
     detections = _fetch_detections(prediction_id)
     _detections_by_chat[chat_id] = detections
+
+    image_width = result.get("image_width")
+    image_height = result.get("image_height")
+    if isinstance(image_width, int) and isinstance(image_height, int):
+        _detection_image_size_by_chat[chat_id] = (image_width, image_height)
+    else:
+        _detection_image_size_by_chat.pop(chat_id, None)
+
+    logger.info(
+        "detect_objects chat_id=%s prediction_id=%s image_size=%sx%s detections=%d raw_boxes=%s",
+        chat_id, prediction_id, image_width, image_height, len(detections),
+        [d["box"] for d in detections],
+    )
+
     result["detections"] = detections
     return json.dumps(result)
 
@@ -319,11 +378,12 @@ def _extract_mcp_text(result: Any) -> str:
 
 
 async def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
-    """Call an img-proc-mcp tool. All tools now take S3 key(s) in `arguments`
-    (e.g. input_s3_key, or base_s3_key/region_s3_key for paste) and return a
-    plain output_s3_key string - no image bytes cross the agent<->MCP call
-    itself. MCP downloads the input(s) from S3, does the pixel op, uploads
-    the result under a fresh key, and hands back only that key."""
+    """Call an img-proc-mcp tool. All tools take S3 key(s) in `arguments`
+    (input_s3_key + output_s3_key, or base_s3_key/region_s3_key/output_s3_key
+    for paste) and return a plain output_s3_key string - no image bytes cross
+    the agent<->MCP call itself. MCP downloads the input(s) from S3, does the
+    pixel op, uploads the result to the given output_s3_key (overwriting
+    whatever was already there), and hands back that same key."""
     client = MultiServerMCPClient(
         {
             "img-proc": {
@@ -346,39 +406,68 @@ async def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
 _processed_images: dict[str, str] = {}
 
 
-def _scratch_s3_key(chat_id: str, label: str) -> str:
-    """Key for an image staged in S3 purely to hand off to img-proc-mcp (an
-    upload, a crop, an operation result) - distinct from the durable
-    <chat_id>/current.png and <chat_id>/operations/... keys, which only ever
-    hold a chat's actual state, not MCP call scratch data."""
-    return f"{chat_id}/scratch/{uuid.uuid4()}-{label}.png"
-
-
 async def _call_mcp_object_op(operation: str, arguments: dict, chat_id: str, input_s3_key: str, box: list) -> str:
     """crop -> operation -> paste, all via S3 keys: MCP crops just the
     bounding-box region out of the full image (so only that small region -
     not the whole image - ever gets downloaded again for the blur/rotate/etc
     step), transforms it, then pastes the transformed region back into the
-    full image. Returns the S3 key of the final, full-size composited image."""
+    full image. Every step writes to one of two well-known per-chat scratch
+    keys (overwritten in place), not a fresh S3 object per call - see
+    _scratch_base_s3_key/_scratch_region_s3_key. Returns the S3 key of the
+    final, full-size composited image (the same key as input_s3_key, since
+    paste's output overwrites it)."""
     left, top, right, bottom = (int(round(v)) for v in box)
-    region_s3_key = await _call_mcp_tool(
-        "crop", {"input_s3_key": input_s3_key, "left": left, "top": top, "right": right, "bottom": bottom}
+    region_s3_key = _scratch_region_s3_key(chat_id)
+    await _call_mcp_tool(
+        "crop",
+        {"input_s3_key": input_s3_key, "output_s3_key": region_s3_key, "left": left, "top": top, "right": right, "bottom": bottom},
     )
-    transformed_region_s3_key = await _call_mcp_tool(operation, {"input_s3_key": region_s3_key, **arguments})
+    await _call_mcp_tool(operation, {"input_s3_key": region_s3_key, "output_s3_key": region_s3_key, **arguments})
     return await _call_mcp_tool(
         "paste",
-        {"base_s3_key": input_s3_key, "region_s3_key": transformed_region_s3_key, "left": left, "top": top},
+        {
+            "base_s3_key": input_s3_key,
+            "region_s3_key": region_s3_key,
+            "output_s3_key": input_s3_key,
+            "left": left,
+            "top": top,
+        },
     )
 
 
-def _resolve_object_box(label: str, rank_from_left: int | None, rank_from_right: int | None) -> tuple[list | None, str | None]:
+def _scale_box(box: list, from_size: tuple[int, int], to_size: tuple[int, int]) -> list:
+    """Scale a [left, top, right, bottom] box proportionally from the image
+    size it was measured against to a different current image size (e.g. the
+    image was resized between detect_objects and this edit, or - before the
+    EXIF-normalization fix - the two pipelines silently disagreed on
+    orientation/dimensions). A no-op when the sizes already match."""
+    from_width, from_height = from_size
+    to_width, to_height = to_size
+    if from_width <= 0 or from_height <= 0:
+        return box
+    scale_x = to_width / from_width
+    scale_y = to_height / from_height
+    if scale_x == 1.0 and scale_y == 1.0:
+        return box
+    left, top, right, bottom = box
+    return [left * scale_x, top * scale_y, right * scale_x, bottom * scale_y]
+
+
+def _resolve_object_box(
+    label: str, rank_from_left: int | None, rank_from_right: int | None, current_image_size: Optional[tuple[int, int]]
+) -> tuple[list | None, str | None]:
     """Resolve (label, rank) to a box, entirely in code. We deliberately do NOT
     ask the LLM to compare box coordinates or pick a raw index itself - even
     when handed pre-computed rank_from_left/rank_from_right values, this small
     model has been observed to state the correct rank in its own reasoning and
     then still pick the wrong object. Reducing its job to "translate the
     phrase 'second from the right' into rank_from_right=2" - a literal
-    wording-to-number copy, not a comparison across a list - is reliable."""
+    wording-to-number copy, not a comparison across a list - is reliable.
+
+    If the image currently being edited has different pixel dimensions than
+    what YOLO measured this box against (_detection_image_size_by_chat), the
+    box is scaled proportionally before being returned, so it still lands on
+    the right region of the current image."""
     chat_id = _normalized_chat_id()
     candidates = [d for d in _detections_by_chat.get(chat_id, []) if d["label"] == label]
     if not candidates:
@@ -389,7 +478,16 @@ def _resolve_object_box(label: str, rank_from_left: int | None, rank_from_right:
     match = next((d for d in candidates if d[rank_field] == rank), None)
     if match is None:
         return None, f"No '{label}' with {rank_field}={rank}. There are only {len(candidates)}."
-    return match["box"], None
+
+    box = match["box"]
+    detection_size = _detection_image_size_by_chat.get(chat_id)
+    if detection_size is not None and current_image_size is not None and detection_size != current_image_size:
+        logger.warning(
+            "Scaling box for chat_id=%s: detection was measured at %s but current image is %s",
+            chat_id, detection_size, current_image_size,
+        )
+        box = _scale_box(box, detection_size, current_image_size)
+    return box, None
 
 
 def _run_image_op(
@@ -418,18 +516,23 @@ def _run_image_op(
 
     box = None
     if label is not None:
-        box, error = _resolve_object_box(label, rank_from_left, rank_from_right)
+        current_image_size = _image_size(image_b64)
+        box, error = _resolve_object_box(label, rank_from_left, rank_from_right, current_image_size)
         if error:
             return json.dumps({"error": error})
 
     try:
         # Stage the current image in S3 so img-proc-mcp can pull it by key -
         # the agent<->MCP call itself carries only that key, never the bytes.
-        input_s3_key = _scratch_s3_key(chat_id, "input")
+        # One stable key per chat, overwritten on every edit - not a fresh S3
+        # object per call.
+        input_s3_key = _scratch_base_s3_key(chat_id)
         _upload_bytes_to_s3(base64.b64decode(image_b64), input_s3_key, content_type="image/png")
 
         if box is None:
-            output_s3_key = asyncio.run(_call_mcp_tool(operation, {"input_s3_key": input_s3_key, **arguments}))
+            output_s3_key = asyncio.run(
+                _call_mcp_tool(operation, {"input_s3_key": input_s3_key, "output_s3_key": input_s3_key, **arguments})
+            )
         else:
             output_s3_key = asyncio.run(
                 _call_mcp_object_op(operation, arguments, chat_id, input_s3_key, box)
@@ -445,10 +548,10 @@ def _run_image_op(
 
     _current_working_image[chat_id] = result_b64  # so the next edit builds on this one
     operation_id = str(uuid.uuid4())
-    # Persist the full processed image to S3 so it survives a restart, and archive
-    # this specific edit's result under its own key for history/debugging.
+    # The only S3 write that needs to persist between chat turns - everything
+    # upstream of this (the scratch base/region keys) was just handoff data
+    # for this one request and gets overwritten by the next edit.
     _persist_current_image_to_s3(chat_id, result_b64)
-    _persist_operation_image_to_s3(chat_id, operation_id, operation, result_b64)
     _processed_images[operation_id] = result_b64
     result = {"status": "ok", "operation": operation, "operation_id": operation_id, **arguments}
     if label is not None:
@@ -1196,14 +1299,24 @@ def _reorder_clauses_to_avoid_content_filter(text: str) -> str:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
+    normalized_chat_id = (request.chat_id or "chat").strip() or "chat"
+    newest_message = request.messages[-1] if request.messages else None
+    is_new_upload = (
+        newest_message is not None and newest_message.role == "user" and bool(newest_message.image_base64)
+    )
+    if is_new_upload:
+        # Normalize EXIF orientation once, right here, before this upload is
+        # used for anything (YOLO detection, S3 persistence, edits) - see
+        # _normalize_image_orientation for why every downstream consumer
+        # needs to agree on the same pixel grid.
+        newest_message.image_base64 = _normalize_image_orientation(newest_message.image_base64)
+
     latest_image = None
     for msg in request.messages:
         if msg.role == "user" and msg.image_base64:
             latest_image = msg.image_base64          # saved for detect_objects tool
 
-    normalized_chat_id = (request.chat_id or "chat").strip() or "chat"
-    newest_message = request.messages[-1] if request.messages else None
-    if newest_message is not None and newest_message.role == "user" and newest_message.image_base64:
+    if is_new_upload:
         # A brand new image was just uploaded this turn - start a fresh edit chain
         # instead of continuing to build on whatever was edited before it. Also
         # drop the persisted S3 copy, or _get_current_image would resurrect the
@@ -1214,6 +1327,14 @@ def chat(request: ChatRequest):
         # or detect_objects call runs.
         _current_working_image.pop(normalized_chat_id, None)
         _delete_current_image_from_s3(normalized_chat_id)
+        # Also drop any detections/size from a PREVIOUS image in this same
+        # chat_id - otherwise "blur the second dog" on the new image could
+        # resolve against boxes measured on the old one if the user asks for
+        # an object edit before detect_objects has run again for this upload.
+        # (_object_reference_hints_by_chat is handled separately below,
+        # re-derived from this turn's own message either way.)
+        _detections_by_chat.pop(normalized_chat_id, None)
+        _detection_image_size_by_chat.pop(normalized_chat_id, None)
 
     parsed_hints: dict[str, dict] = {}
     if newest_message is not None and newest_message.role == "user":

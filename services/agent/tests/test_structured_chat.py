@@ -340,16 +340,16 @@ def test_blur_image_uploads_input_to_s3_calls_mcp_with_key_and_hides_image_bytes
         assert "image_b64" not in arguments  # no raw bytes cross the MCP call
         assert arguments["radius"] == 3.0
         input_key = arguments["input_s3_key"]
-        # Simulate the MCP server: download input, "process", upload result under a new key.
-        s3_store["mcp-output.png"] = s3_store[input_key] + b"-blurred"
-        return "mcp-output.png"
+        output_key = arguments["output_s3_key"]
+        # Simulate the MCP server: download input, "process", overwrite output_s3_key.
+        s3_store[output_key] = s3_store[input_key] + b"-blurred"
+        return output_key
 
     monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", fake_upload)
     monkeypatch.setattr(agent_app, "_download_bytes_from_s3", fake_download)
     monkeypatch.setattr(agent_app, "_call_mcp_tool", fake_call_mcp_tool)
     monkeypatch.setattr(agent_app, "_processed_images", {})
     monkeypatch.setattr(agent_app, "_persist_current_image_to_s3", lambda *a, **k: None)
-    monkeypatch.setattr(agent_app, "_persist_operation_image_to_s3", lambda *a, **k: None)
 
     image_token = agent_app._current_image_b64.set("aW1hZ2U=")
     try:
@@ -362,7 +362,10 @@ def test_blur_image_uploads_input_to_s3_calls_mcp_with_key_and_hides_image_bytes
     assert payload["operation"] == "blur"
     assert payload["radius"] == 3.0
     assert "image_b64" not in raw
-    assert captured_call["arguments"]["input_s3_key"].endswith("-input.png")
+    # Input and output are the SAME stable per-chat scratch key, overwritten
+    # in place - not a fresh S3 object per call.
+    assert captured_call["arguments"]["input_s3_key"] == captured_call["arguments"]["output_s3_key"]
+    assert captured_call["arguments"]["input_s3_key"].endswith("/scratch/base.png")
 
     operation_id = payload["operation_id"]
     expected_result_b64 = base64.b64encode(b"image-blurred").decode("utf-8")
@@ -423,13 +426,7 @@ def test_call_mcp_object_op_uses_s3_keys_for_crop_operation_paste(monkeypatch):
 
     async def fake_call_mcp_tool(tool_name, arguments):
         calls.append((tool_name, arguments))
-        if tool_name == "crop":
-            return "region-key.png"
-        if tool_name == "blur":
-            return "transformed-region-key.png"
-        if tool_name == "paste":
-            return "final-key.png"
-        raise AssertionError(f"unexpected tool {tool_name}")
+        return arguments["output_s3_key"] if tool_name != "paste" else arguments["output_s3_key"]
 
     monkeypatch.setattr(agent_app, "_call_mcp_tool", fake_call_mcp_tool)
 
@@ -439,15 +436,31 @@ def test_call_mcp_object_op_uses_s3_keys_for_crop_operation_paste(monkeypatch):
         )
     )
 
-    assert result == "final-key.png"
-    assert calls[0] == (
-        "crop",
-        {"input_s3_key": "input-key.png", "left": 10, "top": 20, "right": 30, "bottom": 40},
+    # paste's output_s3_key overwrites the original full-image key, so that's
+    # what the whole chain returns as the final result location.
+    assert result == "input-key.png"
+    crop_call = calls[0]
+    blur_call = calls[1]
+    paste_call = calls[2]
+
+    assert crop_call[0] == "crop"
+    assert crop_call[1]["input_s3_key"] == "input-key.png"
+    region_key = crop_call[1]["output_s3_key"]
+    assert (crop_call[1]["left"], crop_call[1]["top"], crop_call[1]["right"], crop_call[1]["bottom"]) == (10, 20, 30, 40)
+
+    assert blur_call == (
+        "blur", {"input_s3_key": region_key, "output_s3_key": region_key, "radius": 2.0},
     )
-    assert calls[1] == ("blur", {"input_s3_key": "region-key.png", "radius": 2.0})
-    assert calls[2] == (
+
+    assert paste_call == (
         "paste",
-        {"base_s3_key": "input-key.png", "region_s3_key": "transformed-region-key.png", "left": 10, "top": 20},
+        {
+            "base_s3_key": "input-key.png",
+            "region_s3_key": region_key,
+            "output_s3_key": "input-key.png",
+            "left": 10,
+            "top": 20,
+        },
     )
 
 
@@ -554,24 +567,6 @@ def test_persist_current_image_to_s3_uses_png_content_type(monkeypatch):
 
     assert captured["content_type"] == "image/png"
     assert captured["s3_key"] == "chat-1/current.png"
-
-
-def test_persist_operation_image_to_s3_uses_operations_key_and_png_content_type(monkeypatch):
-    captured = {}
-
-    def fake_upload(data, s3_key, content_type="image/jpeg"):
-        captured["content_type"] = content_type
-        captured["s3_key"] = s3_key
-
-    monkeypatch.setattr(agent_app, "AWS_REGION", "us-east-1")
-    monkeypatch.setattr(agent_app, "AWS_S3_BUCKET", "some-bucket")
-    monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", fake_upload)
-
-    image_b64 = base64.b64encode(b"png-bytes").decode("utf-8")
-    agent_app._persist_operation_image_to_s3("chat-1", "op-42", "blur", image_b64)
-
-    assert captured["content_type"] == "image/png"
-    assert captured["s3_key"] == "chat-1/operations/op-42-blur.png"
 
 
 def test_get_current_image_falls_back_to_s3_when_memory_is_empty(monkeypatch):

@@ -2,7 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import FileResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from ultralytics import YOLO
-from PIL import Image
+from PIL import Image, ImageOps
+from PIL import Image as _PILImage
 from pydantic import BaseModel
 import logging
 import os
@@ -19,6 +20,7 @@ from models import DetectionObject, PredictionSession
 from s3_utils import download_file_from_s3, upload_file_to_s3
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 # Disable GPU usage
 torch.cuda.is_available = lambda: False
@@ -36,6 +38,8 @@ class PredictResponse(BaseModel):
     detection_count: int
     labels: list[str]
     time_took: float
+    image_width: int
+    image_height: int
 
 
 class PredictRequest(BaseModel):
@@ -83,6 +87,37 @@ def _format_timestamp(timestamp):
     if timestamp is None:
         return None
     return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_orientation_in_place(image_path: str) -> tuple[int, int]:
+    """Bake the image's EXIF orientation into its actual pixel grid and
+    overwrite the file on disk, then strip the EXIF orientation tag (now
+    redundant) by re-saving without exif data. Without this, a portrait photo
+    shot on a phone (EXIF orientation != 1, stored as landscape pixels with a
+    "rotate on display" tag) would have YOLO's own loader auto-rotate it
+    internally for detection while every downstream consumer that re-encodes
+    the file (S3 persistence, MCP's crop/paste) sees the raw un-rotated
+    pixels - so a box measured against the rotated view lands on the wrong
+    region, or spans almost the entire un-rotated image, once it's used to
+    crop for an edit. Baking the rotation in once, here, before anything else
+    reads the file, means every later consumer already agrees on orientation
+    and no one needs to re-apply EXIF logic. Returns the resulting (width, height).
+    """
+    # Uses the PIL Image class directly (via a private alias), not the
+    # module-level `Image` name - tests monkeypatch `app.Image` to stub out
+    # the annotated-plot save step, and this normalization step must keep
+    # working (real EXIF handling on a real file) regardless of that.
+    with _PILImage.open(image_path) as image:
+        normalized = ImageOps.exif_transpose(image)
+        normalized.save(image_path)
+        return normalized.size
+
+
+def _log_detections(uid: str, width: int, height: int, boxes: list) -> None:
+    logger.info(
+        "predict uid=%s image_size=%dx%d detections=%d raw_boxes(x1,y1,x2,y2)=%s",
+        uid, width, height, len(boxes), boxes,
+    )
 
 
 def save_prediction_session(db_session: Session, uid: str, original_image: str, predicted_image: str):
@@ -155,6 +190,19 @@ def predict(request: PredictRequest, db_session: Session = Depends(get_db)):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to download image from S3: {exc}") from exc
 
+    # Bake EXIF orientation into the pixel grid before anything reads this
+    # file, and push the normalized bytes back to the SAME S3 key - so every
+    # later consumer (the agent's edit pipeline re-downloading this same
+    # image, img-proc-mcp) sees pixel-identical orientation to what YOLO
+    # measured its boxes against, with no EXIF tag left to disagree about.
+    width, height = _normalize_orientation_in_place(original_path)
+    try:
+        upload_file_to_s3(original_path, image_s3_key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"S3 configuration error: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to upload normalized image to S3: {exc}") from exc
+
     results = model(original_path, device="cpu", conf=CONFIDENCE_THRESHOLD)
 
     annotated_frame = results[0].plot()
@@ -173,6 +221,7 @@ def predict(request: PredictRequest, db_session: Session = Depends(get_db)):
     save_prediction_session(db_session, uid, image_s3_key, predicted_s3_key)
 
     detected_labels = []
+    raw_boxes = []
     for box in results[0].boxes:
         label_idx = int(box.cls[0].item())
         label = model.names[label_idx]
@@ -180,6 +229,9 @@ def predict(request: PredictRequest, db_session: Session = Depends(get_db)):
         bbox = box.xyxy[0].tolist()
         save_detection_object(db_session, uid, label, score, bbox)
         detected_labels.append(label)
+        raw_boxes.append(bbox)
+
+    _log_detections(uid, width, height, raw_boxes)
 
     db_session.commit()
     processing_time = round(time.time() - start_time, 2)
@@ -189,6 +241,8 @@ def predict(request: PredictRequest, db_session: Session = Depends(get_db)):
         detection_count=len(results[0].boxes),
         labels=detected_labels,
         time_took=processing_time,
+        image_width=width,
+        image_height=height,
     )
 
 
