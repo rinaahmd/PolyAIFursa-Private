@@ -4,7 +4,7 @@ services:
       context: ./services/frontend
       args:
         NEXT_PUBLIC_AGENT_URL: ${NEXT_PUBLIC_AGENT_URL:-http://localhost:8000}
-    image: rinaahmd/frontend-service:0.0.2
+    image: rinaahmd/frontend-service:${FRONTEND_IMAGE_TAG:-0.0.2}
     environment:
       - NEXT_PUBLIC_AGENT_URL=${NEXT_PUBLIC_AGENT_URL:-http://localhost:8000}
     ports:
@@ -15,11 +15,14 @@ services:
       - agent
 
   agent:
-    image: rinaahmd/agent-service:0.0.1
+    build:
+      context: ./services/agent
+    image: rinaahmd/agent-service:${AGENT_IMAGE_TAG:-0.0.1}
     ports:
       - "8000:8000"
     environment:
       - YOLO_SERVICE_URL=http://yolo:8080
+      - IMG_PROC_MCP_URL=http://img-proc-mcp:9000/mcp
       - MODEL=amazon.nova-micro-v1:0
       - AWS_REGION=us-east-1
       - AWS_S3_BUCKET=rina-polyai-images
@@ -29,12 +32,13 @@ services:
       - polyai-net
     depends_on:
       - yolo
+      - img-proc-mcp
 
 
 
 
   yolo:
-    image: rinaahmd/yolo-service:0.0.1
+    image: rinaahmd/yolo-service:${YOLO_IMAGE_TAG:-0.0.1}
     ports:
       - "8080:8080"
     environment:
@@ -44,6 +48,30 @@ services:
       - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
+
+  img-proc-mcp:
+    build:
+      context: ./services/img-proc-mcp
+    image: rinaahmd/img-proc-mcp-service:${IMG_PROC_MCP_IMAGE_TAG:-0.0.1}
+    ports:
+      - "9000:9000"
+    networks:
+      - polyai-net
+
+  node-exporter:
+    image: prom/node-exporter
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    networks:
+      - monitoring-net
 
   prometheus:
     image: prom/prometheus
@@ -57,6 +85,7 @@ services:
       - polyai-net
     depends_on:
       - yolo
+      - node-exporter
 
   grafana:
     image: grafana/grafana

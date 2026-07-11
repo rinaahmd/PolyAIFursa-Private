@@ -258,6 +258,13 @@ def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
                 "time_took": 0.1,
             }
 
+    class FakeDetectionsResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"detection_objects": []}
+
     class FakeHttpxClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -272,6 +279,11 @@ def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
             captured["url"] = url
             captured["post_kwargs"] = kwargs
             return FakeResponse()
+
+        def get(self, url, **kwargs):
+            # detect_objects also fetches per-object boxes via a follow-up
+            # GET /prediction/{uid} call - see _fetch_detections in app.py.
+            return FakeDetectionsResponse()
 
     monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", fake_upload_bytes_to_s3)
     monkeypatch.setattr(agent_app.httpx, "Client", FakeHttpxClient)
@@ -307,3 +319,193 @@ def test_detect_objects_uploads_to_s3_and_calls_yolo_with_json(monkeypatch):
     expected_key = f"chat-42/{prediction_id}/original/image.jpg"
     assert body["image_s3_key"] == expected_key
     assert captured["uploaded_key"] == expected_key
+
+
+def test_blur_image_calls_mcp_and_hides_image_bytes_from_tool_output(monkeypatch):
+    async def fake_call_mcp_tool(tool_name, arguments):
+        assert tool_name == "blur"
+        assert arguments == {"image_b64": "aW1hZ2U=", "radius": 3.0}
+        return "Ymx1cnJlZC1pbWFnZQ=="
+
+    monkeypatch.setattr(agent_app, "_call_mcp_tool", fake_call_mcp_tool)
+    monkeypatch.setattr(agent_app, "_processed_images", {})
+
+    image_token = agent_app._current_image_b64.set("aW1hZ2U=")
+    try:
+        raw = agent_app.blur_image.invoke({"radius": 3.0})
+    finally:
+        agent_app._current_image_b64.reset(image_token)
+
+    payload = json.loads(raw)
+    assert payload["status"] == "ok"
+    assert payload["operation"] == "blur"
+    assert payload["radius"] == 3.0
+    assert "Ymx1cnJlZC1pbWFnZQ==" not in raw
+
+    operation_id = payload["operation_id"]
+    assert agent_app._processed_images[operation_id] == "Ymx1cnJlZC1pbWFnZQ=="
+
+
+def test_blur_image_returns_error_when_no_image_provided():
+    image_token = agent_app._current_image_b64.set(None)
+    try:
+        raw = agent_app.blur_image.invoke({})
+    finally:
+        agent_app._current_image_b64.reset(image_token)
+
+    assert json.loads(raw) == {"error": "No image was provided by the user."}
+
+
+def test_blur_image_returns_error_when_mcp_call_fails(monkeypatch):
+    async def failing_call_mcp_tool(tool_name, arguments):
+        raise RuntimeError("img-proc-mcp unreachable")
+
+    monkeypatch.setattr(agent_app, "_call_mcp_tool", failing_call_mcp_tool)
+
+    image_token = agent_app._current_image_b64.set("aW1hZ2U=")
+    try:
+        raw = agent_app.blur_image.invoke({})
+    finally:
+        agent_app._current_image_b64.reset(image_token)
+
+    payload = json.loads(raw)
+    assert "error" in payload
+    assert "img-proc-mcp unreachable" in payload["error"]
+
+
+def test_run_agent_surfaces_processed_image_from_blur_tool(monkeypatch):
+    first = AIMessage(
+        content="calling blur tool",
+        tool_calls=[{"id": "tool-1", "name": "blur_image", "args": {"radius": 2.0}}],
+    )
+    second = AIMessage(content="done", tool_calls=[])
+    monkeypatch.setattr(agent_app, "llm_with_tools", FakeLLMWithTools([first, second]))
+
+    monkeypatch.setattr(agent_app, "_processed_images", {"op-1": "Ymx1cnJlZC1pbWFnZQ=="})
+
+    class FakeBlurTool:
+        name = "blur_image"
+
+        def invoke(self, tool_call):
+            return ToolMessage(
+                tool_call_id=tool_call["id"],
+                content=json.dumps({"status": "ok", "operation": "blur", "operation_id": "op-1", "radius": 2.0}),
+            )
+
+    monkeypatch.setitem(agent_app.TOOLS, "blur_image", FakeBlurTool())
+
+    data = agent_app.run_agent([HumanMessage(content="blur it")])
+
+    assert data["response"] == "done"
+    assert data["processed_image"] == "Ymx1cnJlZC1pbWFnZQ=="
+    assert "op-1" not in agent_app._processed_images
+
+
+def test_run_agent_processed_image_is_none_when_blur_not_called(monkeypatch):
+    monkeypatch.setattr(
+        agent_app,
+        "llm_with_tools",
+        FakeLLMWithTools([AIMessage(content="hello", tool_calls=[])]),
+    )
+
+    data = agent_app.run_agent([HumanMessage(content="hello")])
+
+    assert data["processed_image"] is None
+
+
+@pytest.mark.parametrize(
+    "clause, expected",
+    [
+        ("flip the last person in the right", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
+        ("flip the last person on the right", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
+        ("flip the last person from the right", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
+        ("flip the last person", {"label": "person", "rank_from_left": None, "rank_from_right": 1}),
+        ("flip the last person from the left", {"label": "person", "rank_from_left": None, "rank_from_right": 1}),
+        ("blur the second dog from the right", {"label": "dog", "rank_from_left": None, "rank_from_right": 2}),
+        ("flip the person on the left", {"label": "person", "rank_from_left": 1, "rank_from_right": None}),
+    ],
+)
+def test_parse_object_reference_in_clause(clause, expected):
+    assert agent_app._parse_object_reference_in_clause(clause) == expected
+
+
+def test_persist_working_image_to_s3_noop_when_not_configured(monkeypatch):
+    monkeypatch.setattr(agent_app, "AWS_REGION", None)
+    monkeypatch.setattr(agent_app, "AWS_S3_BUCKET", None)
+
+    # Must not raise even though S3 isn't configured - persistence is best-effort.
+    agent_app._persist_working_image_to_s3("chat-1", base64.b64encode(b"data").decode("utf-8"))
+
+
+def test_persist_and_download_working_image_round_trip(monkeypatch):
+    store: dict[str, bytes] = {}
+
+    def fake_upload(data, s3_key, content_type="image/jpeg"):
+        store[s3_key] = data
+
+    def fake_download(s3_key):
+        return store.get(s3_key)
+
+    monkeypatch.setattr(agent_app, "AWS_REGION", "us-east-1")
+    monkeypatch.setattr(agent_app, "AWS_S3_BUCKET", "some-bucket")
+    monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", fake_upload)
+    monkeypatch.setattr(agent_app, "_download_bytes_from_s3", fake_download)
+
+    image_b64 = base64.b64encode(b"working-image-bytes").decode("utf-8")
+    agent_app._persist_working_image_to_s3("chat-1", image_b64)
+
+    assert agent_app._download_working_image_from_s3("chat-1") == image_b64
+    assert agent_app._download_working_image_from_s3("chat-2") is None
+
+
+def test_get_current_image_falls_back_to_s3_when_memory_is_empty(monkeypatch):
+    chat_token = agent_app._current_chat_id.set("chat-restore")
+    image_token = agent_app._current_image_b64.set(None)
+    try:
+        monkeypatch.setattr(agent_app, "_download_working_image_from_s3", lambda chat_id: "cmVzdG9yZWQ=")
+        assert agent_app._get_current_image() == "cmVzdG9yZWQ="
+        # Restored copy should now be cached in memory too.
+        assert agent_app._current_working_image["chat-restore"] == "cmVzdG9yZWQ="
+    finally:
+        agent_app._current_chat_id.reset(chat_token)
+        agent_app._current_image_b64.reset(image_token)
+
+
+def test_get_current_image_falls_back_to_original_upload_when_no_working_image_in_s3(monkeypatch):
+    """Covers a crash before the first edit (or before detect_objects) ever ran -
+    there is no working-image copy in S3 yet, only the raw upload."""
+    chat_token = agent_app._current_chat_id.set("chat-restore-2")
+    image_token = agent_app._current_image_b64.set(None)
+    try:
+        monkeypatch.setattr(agent_app, "_download_working_image_from_s3", lambda chat_id: None)
+        monkeypatch.setattr(
+            agent_app,
+            "_download_bytes_from_s3_as_b64",
+            lambda s3_key: "b3JpZ2luYWw=" if s3_key == agent_app._original_image_s3_key("chat-restore-2") else None,
+        )
+        assert agent_app._get_current_image() == "b3JpZ2luYWw="
+        assert agent_app._current_working_image["chat-restore-2"] == "b3JpZ2luYWw="
+    finally:
+        agent_app._current_chat_id.reset(chat_token)
+        agent_app._current_image_b64.reset(image_token)
+
+
+def test_persist_original_image_to_s3_round_trip(monkeypatch):
+    store: dict[str, bytes] = {}
+
+    def fake_upload(data, s3_key, content_type="image/jpeg"):
+        store[s3_key] = data
+
+    def fake_download(s3_key):
+        return store.get(s3_key)
+
+    monkeypatch.setattr(agent_app, "AWS_REGION", "us-east-1")
+    monkeypatch.setattr(agent_app, "AWS_S3_BUCKET", "some-bucket")
+    monkeypatch.setattr(agent_app, "_upload_bytes_to_s3", fake_upload)
+    monkeypatch.setattr(agent_app, "_download_bytes_from_s3", fake_download)
+
+    image_b64 = base64.b64encode(b"raw-upload-bytes").decode("utf-8")
+    agent_app._persist_original_image_to_s3("chat-1", image_b64)
+
+    assert agent_app._download_bytes_from_s3_as_b64(agent_app._original_image_s3_key("chat-1")) == image_b64
+    assert agent_app._download_bytes_from_s3_as_b64(agent_app._original_image_s3_key("chat-2")) is None

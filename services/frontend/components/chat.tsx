@@ -69,6 +69,9 @@ export default function Chat() {
           ...(reply.annotated_image
             ? { annotated_image: reply.annotated_image }
             : {}),
+          ...(reply.processed_image
+            ? { processed_image: reply.processed_image }
+            : {}),
         },
       ]);
     } catch (err) {

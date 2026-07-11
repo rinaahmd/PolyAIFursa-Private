@@ -18,6 +18,7 @@ def test_chat_returns_structured_response_from_mocked_run_agent(monkeypatch):
         "response": "hello from mock",
         "prediction_id": "pred-123",
         "annotated_image": "ZmFrZS1pbWFnZQ==",
+        "processed_image": None,
         "agent_loop_time_s": 0.123,
         "iterations": 2,
         "tools_called": ["detect_objects"],
@@ -27,7 +28,10 @@ def test_chat_returns_structured_response_from_mocked_run_agent(monkeypatch):
 
     def fake_run_agent(history, max_iterations=10):
         assert len(history) == 1
-        assert history[0].content == "hello"
+        # chat() appends a per-turn reminder telling the model to actually use
+        # tools rather than claim to without calling them - see app.py's `reminder`.
+        assert history[0].content.startswith("hello")
+        assert "Use the available tools to fulfill this request" in history[0].content
         assert max_iterations == 10
         return mocked_response
 
@@ -44,6 +48,7 @@ def test_chat_returns_structured_response_from_mocked_run_agent(monkeypatch):
     assert "response" in data
     assert "prediction_id" in data
     assert "annotated_image" in data
+    assert "processed_image" in data
     assert "agent_loop_time_s" in data
     assert "iterations" in data
     assert "tools_called" in data
