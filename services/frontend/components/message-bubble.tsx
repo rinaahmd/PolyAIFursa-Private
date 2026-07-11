@@ -31,7 +31,13 @@ export default function MessageBubble({ message }: { message: ChatMessage }) {
                 {message.content}
               </ReactMarkdown>
             </div>
-            {message.annotated_image && (
+            {/* When an edit ran, its result is what the user asked for - the
+                boxed detection image behind it (from the detect_objects call
+                needed to resolve "the last person on the right" etc.) is an
+                internal step, not the answer, so it's hidden whenever a
+                processed_image is also present. Only shown on its own for a
+                pure detection query with no edit (e.g. "what's in this image"). */}
+            {message.annotated_image && !message.processed_image && (
               <img
                 src={`data:image/jpeg;base64,${message.annotated_image}`}
                 alt="annotated"

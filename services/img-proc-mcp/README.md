@@ -2,9 +2,13 @@
 
 An MCP (Model Context Protocol) server, built with [FastMCP](https://github.com/jlowin/fastmcp), that exposes image manipulation tools over HTTP. The Vision Agent connects to it as an MCP client to process images on demand.
 
+This server is stateless with respect to the *agent's* conversation state (chat history, edit chains, etc. all live in the agent), but it does talk to S3 directly: every tool takes an S3 key pointing at its input image(s), downloads from S3, performs the operation, uploads the result to a new S3 key, and returns just that key - no image bytes are ever sent in the MCP request or response. See "Tools" below for the exact key names.
+
 ## Prerequisites
 
 - Python 3.10+
+- AWS credentials available to the process (an EC2 instance role, or a mounted `~/.aws` locally - see `docker-compose.yml`). Never hard-code credentials in this service.
+- `AWS_REGION` and `AWS_S3_BUCKET` environment variables set.
 
 ## Setup
 
@@ -12,6 +16,11 @@ Install dependencies (from `services/img-proc-mcp/`):
 
 ```bash
 pip install -r requirements.txt
+```
+
+```bash
+export AWS_REGION=us-east-1
+export AWS_S3_BUCKET=your-bucket-name
 ```
 
 ## Running
@@ -30,14 +39,17 @@ pytest tests/
 
 ## Tools
 
+Every tool downloads its input(s) from S3, applies the operation, uploads the PNG result under a fresh key (`img-proc-mcp/<operation>/<uuid>.png`), and returns that `output_s3_key` as a plain string.
+
 | Tool | Description |
 |---|---|
-| `blur` | Apply Gaussian blur to a base64-encoded image. Takes `image_b64` and an optional `radius` (default `2.0`). Returns a base64-encoded PNG. |
-| `rotate` | Rotate an image counter-clockwise by `angle` degrees. Returns a base64-encoded PNG. |
-| `flip` | Flip an image. `direction` is `"horizontal"` (default) or `"vertical"`. Returns a base64-encoded PNG. |
-| `resize` | Resize an image to an exact `width` x `height` in pixels. Returns a base64-encoded PNG. |
-| `crop` | Crop an image to the box `(left, top, right, bottom)` in pixels. Returns a base64-encoded PNG. |
-| `add_noise` | Add salt-and-pepper noise to an image. `amount` is the fraction of pixels affected (default `0.05`). Returns a base64-encoded PNG. |
+| `blur` | Apply Gaussian blur. Takes `input_s3_key` and an optional `radius` (default `2.0`). |
+| `rotate` | Rotate counter-clockwise by `angle` degrees. Takes `input_s3_key`, `angle`, optional `expand` (default `True`). |
+| `flip` | Flip an image. Takes `input_s3_key`, `direction` (`"horizontal"` default, or `"vertical"`). |
+| `resize` | Resize to an exact `width` x `height` in pixels. Takes `input_s3_key`, `width`, `height`. |
+| `crop` | Crop to the box `(left, top, right, bottom)` in pixels. Takes `input_s3_key`, `left`, `top`, `right`, `bottom`. |
+| `add_noise` | Add salt-and-pepper noise. Takes `input_s3_key`, optional `amount` (default `0.05`, fraction of pixels affected). |
+| `paste` | Paste `region_s3_key` into `base_s3_key` at `(left, top)`, overwriting that area. Used to composite a transformed sub-region back into the full image after an object-scoped edit. |
 
 ## Talking to the server directly
 
@@ -66,7 +78,7 @@ curl -s -X POST http://localhost:9000/mcp \
   -H "mcp-session-id: <SESSION_ID>" \
   -d '{"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}'
 
-# 3. Call the blur tool
+# 3. Call the blur tool - input_s3_key must already exist in AWS_S3_BUCKET
 curl -s -X POST http://localhost:9000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
@@ -77,7 +89,7 @@ curl -s -X POST http://localhost:9000/mcp \
     "method": "tools/call",
     "params": {
       "name": "blur",
-      "arguments": { "image_b64": "<BASE64_ENCODED_IMAGE>", "radius": 2.0 }
+      "arguments": { "input_s3_key": "some-chat-id/scratch/example-input.png", "radius": 2.0 }
     }
   }'
 ```
