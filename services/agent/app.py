@@ -90,29 +90,30 @@ _current_working_image: dict[str, str] = {}
 _object_reference_hints_by_chat: dict[str, dict[str, dict]] = {}
 
 
-def _working_image_s3_key(chat_id: str) -> str:
-    return f"{chat_id}/working_image.b64"
+def _current_image_s3_key(chat_id: str) -> str:
+    return f"{chat_id}/current.png"
 
 
-def _original_image_s3_key(chat_id: str) -> str:
-    return f"{chat_id}/original_upload.b64"
+def _operation_image_s3_key(chat_id: str, operation_id: str, operation: str) -> str:
+    return f"{chat_id}/operations/{operation_id}-{operation}.png"
 
 
 def _get_current_image() -> Optional[str]:
+    """Resolve the image the next tool call should operate on, in order:
+    1. in-memory current image (this process already has it cached),
+    2. <chat_id>/current.png from S3 (durable copy from the last successful
+       edit - survives an agent restart or a request landing on a different
+       worker/instance),
+    3. the image carried on this request's own history (e.g. a fresh upload
+       this turn, before any edit or S3 write has happened for it),
+    4. give up - callers treat None as "no image was provided by the user."
+    """
     chat_id = _normalized_chat_id()
     cached = _current_working_image.get(chat_id)
     if cached is not None:
         return cached
 
-    # In-memory state is gone (process restart, or a fresh worker in a
-    # multi-instance deployment) - fall back to the copy persisted in S3 by
-    # the last successful edit for this chat, then to the raw upload
-    # persisted in S3 (in case the container fell over before any edit was
-    # ever applied, so no working-image copy exists yet), before giving up
-    # to whatever was passed in on this request.
-    restored = _download_working_image_from_s3(chat_id) or _download_bytes_from_s3_as_b64(
-        _original_image_s3_key(chat_id)
-    )
+    restored = _download_current_image_from_s3(chat_id)
     if restored is not None:
         _current_working_image[chat_id] = restored
         return restored
@@ -148,30 +149,35 @@ def _download_bytes_from_s3(s3_key: str) -> Optional[bytes]:
         return None
 
 
-def _persist_b64_to_s3(image_b64: str, s3_key: str, label: str) -> None:
+def _persist_png_to_s3(image_b64: str, s3_key: str, label: str) -> None:
     """Best-effort write-through - persistence failures (e.g. S3 unreachable)
-    must not fail the caller's request. `label` is just for the log line."""
+    must not fail the caller's request. `label` is just for the log line.
+    The MCP server always returns base64-encoded PNG bytes (see
+    services/img-proc-mcp/app.py's _encode), so decoding here and uploading
+    with ContentType="image/png" stores the actual image, not text."""
     try:
-        _upload_bytes_to_s3(base64.b64decode(image_b64), s3_key)
+        _upload_bytes_to_s3(base64.b64decode(image_b64), s3_key, content_type="image/png")
     except RuntimeError:
         logger.warning("Skipping %s S3 persistence: S3 is not configured", label)
     except (BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError, binascii.Error, ValueError):
         logger.exception("Failed to persist %s to S3 (key=%s)", label, s3_key)
 
 
-def _persist_working_image_to_s3(chat_id: str, image_b64: str) -> None:
-    """So the working image survives an agent restart or a request landing on
+def _persist_current_image_to_s3(chat_id: str, image_b64: str) -> None:
+    """So the current image survives an agent restart or a request landing on
     a different worker. The in-memory copy set by the caller is still
     authoritative for the rest of this process's lifetime regardless of
     whether this S3 write succeeds."""
-    _persist_b64_to_s3(image_b64, _working_image_s3_key(chat_id), "working image")
+    _persist_png_to_s3(image_b64, _current_image_s3_key(chat_id), "current image")
 
 
-def _persist_original_image_to_s3(chat_id: str, image_b64: str) -> None:
-    """So the raw upload survives a restart even if it falls over before any
-    edit tool has run (detect_objects/_run_image_op would otherwise be the
-    only things that ever write this chat's image to S3)."""
-    _persist_b64_to_s3(image_b64, _original_image_s3_key(chat_id), "original upload")
+def _persist_operation_image_to_s3(chat_id: str, operation_id: str, operation: str, image_b64: str) -> None:
+    """Archive a copy of the result of each individual edit, so the edit
+    history for a chat is recoverable from S3 even though only the latest
+    state is kept at <chat_id>/current.png."""
+    _persist_png_to_s3(
+        image_b64, _operation_image_s3_key(chat_id, operation_id, operation), f"{operation} operation result"
+    )
 
 
 def _download_bytes_from_s3_as_b64(s3_key: str) -> Optional[str]:
@@ -181,16 +187,16 @@ def _download_bytes_from_s3_as_b64(s3_key: str) -> Optional[str]:
     return base64.b64encode(data).decode("utf-8")
 
 
-def _download_working_image_from_s3(chat_id: str) -> Optional[str]:
-    return _download_bytes_from_s3_as_b64(_working_image_s3_key(chat_id))
+def _download_current_image_from_s3(chat_id: str) -> Optional[str]:
+    return _download_bytes_from_s3_as_b64(_current_image_s3_key(chat_id))
 
 
-def _delete_working_image_from_s3(chat_id: str) -> None:
+def _delete_current_image_from_s3(chat_id: str) -> None:
     if not AWS_REGION or not AWS_S3_BUCKET:
         return
     s3_client = boto3.client("s3", region_name=AWS_REGION)
     with suppress(BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError):
-        s3_client.delete_object(Bucket=AWS_S3_BUCKET, Key=_working_image_s3_key(chat_id))
+        s3_client.delete_object(Bucket=AWS_S3_BUCKET, Key=_current_image_s3_key(chat_id))
 
 
 def _fetch_detections(prediction_id: str) -> list[dict]:
@@ -407,8 +413,11 @@ def _run_image_op(
         return json.dumps({"error": f"Failed to {operation} image: {exc}"})
 
     _current_working_image[chat_id] = result_b64  # so the next edit builds on this one
-    _persist_working_image_to_s3(chat_id, result_b64)  # ...and survives a restart too
     operation_id = str(uuid.uuid4())
+    # Persist the full processed image to S3 so it survives a restart, and archive
+    # this specific edit's result under its own key for history/debugging.
+    _persist_current_image_to_s3(chat_id, result_b64)
+    _persist_operation_image_to_s3(chat_id, operation_id, operation, result_b64)
     _processed_images[operation_id] = result_b64
     result = {"status": "ok", "operation": operation, "operation_id": operation_id, **arguments}
     if label is not None:
@@ -1168,14 +1177,12 @@ def chat(request: ChatRequest):
         # instead of continuing to build on whatever was edited before it. Also
         # drop the persisted S3 copy, or _get_current_image would resurrect the
         # previous image's edit chain the moment the in-memory dict is empty
-        # (e.g. right after a restart).
+        # (e.g. right after a restart). The upload itself is still available
+        # this turn via _current_image_b64 (step 3 of _get_current_image's
+        # fallback order) and becomes durable in S3 the moment the first edit
+        # or detect_objects call runs.
         _current_working_image.pop(normalized_chat_id, None)
-        _delete_working_image_from_s3(normalized_chat_id)
-        # Persist the raw upload itself immediately, before any tool has run -
-        # otherwise a crash before the first edit (or before detect_objects,
-        # which is the only other thing that writes this chat's image to S3)
-        # would leave nothing recoverable for this chat in S3 at all.
-        _persist_original_image_to_s3(normalized_chat_id, newest_message.image_base64)
+        _delete_current_image_from_s3(normalized_chat_id)
 
     parsed_hints: dict[str, dict] = {}
     if newest_message is not None and newest_message.role == "user":
