@@ -55,6 +55,11 @@ services:
     image: rinaahmd/img-proc-mcp-service:${IMG_PROC_MCP_IMAGE_TAG:-0.0.1}
     ports:
       - "9000:9000"
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_S3_BUCKET=rina-polyai-images
+    volumes:
+      - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
 
@@ -69,6 +74,7 @@ services:
     command:
       - "--path.procfs=/host/proc"
       - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
       - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
     networks:
       - monitoring-net

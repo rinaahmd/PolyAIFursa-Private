@@ -1,5 +1,7 @@
 fastmcp
 pillow
+boto3
 
 # Testing
 pytest
+moto

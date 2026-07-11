@@ -233,11 +233,15 @@ def test_predict_response_shape_matches_contract(api_client, monkeypatch):
 
     assert response.status_code == 200
     data = response.json()
-    assert set(data.keys()) == {"prediction_uid", "detection_count", "labels", "time_took"}
+    assert set(data.keys()) == {
+        "prediction_uid", "detection_count", "labels", "time_took", "image_width", "image_height",
+    }
     assert isinstance(data["prediction_uid"], str)
     assert isinstance(data["detection_count"], int)
     assert isinstance(data["labels"], list)
     assert all(isinstance(label, str) for label in data["labels"])
+    assert isinstance(data["image_width"], int)
+    assert isinstance(data["image_height"], int)
     assert isinstance(data["time_took"], (int, float))
 
 def test_get_prediction_image(api_client, monkeypatch):
@@ -346,7 +350,46 @@ def test_predict_returns_502_on_unexpected_upload_error(api_client, monkeypatch)
     )
 
     assert response.status_code == 502
+    # The normalized-original re-upload (right after EXIF normalization) is
+    # now the first upload_file_to_s3 call in /predict, so it's the one that
+    # surfaces this error - before the predicted-image upload ever runs.
+    assert "Failed to upload normalized image to S3" in response.json()["detail"]
+
+
+def test_predict_returns_502_when_predicted_image_upload_fails(api_client, monkeypatch):
+    _mock_model_and_image(monkeypatch)
+
+    def fake_download(_s3_key, local_path):
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(TEST_IMAGE, "rb") as src, open(local_path, "wb") as dst:
+            dst.write(src.read())
+
+    monkeypatch.setattr("app.download_file_from_s3", fake_download)
+
+    upload_calls = []
+
+    def fake_upload(local_path, s3_key):
+        upload_calls.append(s3_key)
+        if "/predicted/" in s3_key:
+            raise Exception("upload failed")
+
+    monkeypatch.setattr("app.upload_file_to_s3", fake_upload)
+
+    prediction_id = str(uuid.uuid4())
+    response = api_client.post(
+        "/predict",
+        json={
+            "image_s3_key": f"chat/{prediction_id}/original/beatles.jpeg",
+            "prediction_id": prediction_id,
+        },
+    )
+
+    assert response.status_code == 502
     assert "Failed to upload image to S3" in response.json()["detail"]
+    # Confirms the normalized-original re-upload happened (and succeeded)
+    # before the predicted-image upload was attempted and failed.
+    assert any("/original/" in key for key in upload_calls)
+    assert any("/predicted/" in key for key in upload_calls)
 
 
 def test_get_prediction_image_returns_503_when_s3_runtime_error(api_client, monkeypatch):

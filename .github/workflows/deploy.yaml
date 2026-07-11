@@ -17,6 +17,7 @@ jobs:
       yolo: ${{ steps.filter.outputs.yolo }}
       frontend: ${{ steps.filter.outputs.frontend }}
       img-proc-mcp: ${{ steps.filter.outputs['img-proc-mcp'] }}
+      infra: ${{ steps.filter.outputs.infra }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -31,10 +32,13 @@ jobs:
               - 'services/frontend/**'
             img-proc-mcp:
               - 'services/img-proc-mcp/**'
+            infra:
+              - 'docker-compose.yml'
+              - 'prometheus.yml'
 
   deploy-agent:
     needs: changes
-    if: needs.changes.outputs.agent == 'true'
+    if: needs.changes.outputs.agent == 'true' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,9 +69,15 @@ jobs:
             git checkout ${{ github.ref_name }}
             git reset --hard origin/${{ github.ref_name }}
 
-            export AGENT_IMAGE_TAG=${{ github.sha }}
+            touch .env
+            if grep -q '^AGENT_IMAGE_TAG=' .env; then
+              sed -i "s#^AGENT_IMAGE_TAG=.*#AGENT_IMAGE_TAG=${{ github.sha }}#" .env
+            else
+              echo "AGENT_IMAGE_TAG=${{ github.sha }}" >> .env
+            fi
+
             docker compose -f docker-compose.yml pull agent
-            docker compose -f docker-compose.yml up -d agent
+            docker compose -f docker-compose.yml up -d --no-deps agent
 
             for i in $(seq 1 60); do
               curl -fsS http://localhost:8000/health && exit 0
@@ -79,7 +89,7 @@ jobs:
 
   deploy-yolo:
     needs: changes
-    if: needs.changes.outputs.yolo == 'true'
+    if: needs.changes.outputs.yolo == 'true' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -110,9 +120,15 @@ jobs:
             git checkout ${{ github.ref_name }}
             git reset --hard origin/${{ github.ref_name }}
 
-            export YOLO_IMAGE_TAG=${{ github.sha }}
+            touch .env
+            if grep -q '^YOLO_IMAGE_TAG=' .env; then
+              sed -i "s#^YOLO_IMAGE_TAG=.*#YOLO_IMAGE_TAG=${{ github.sha }}#" .env
+            else
+              echo "YOLO_IMAGE_TAG=${{ github.sha }}" >> .env
+            fi
+
             docker compose -f docker-compose.yml pull yolo
-            docker compose -f docker-compose.yml up -d yolo
+            docker compose -f docker-compose.yml up -d --no-deps yolo
 
             for i in $(seq 1 60); do
               curl -fsS http://localhost:8080/health && exit 0
@@ -124,7 +140,7 @@ jobs:
 
   deploy-frontend:
     needs: changes
-    if: needs.changes.outputs.frontend == 'true'
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,10 +173,21 @@ jobs:
             git checkout ${{ github.ref_name }}
             git reset --hard origin/${{ github.ref_name }}
 
-            export FRONTEND_IMAGE_TAG=${{ github.sha }}
-            export NEXT_PUBLIC_AGENT_URL=${{ github.ref_name == 'main' && 'http://3.214.66.146:8000' || 'http://34.224.235.157:8000' }}
+            touch .env
+            NEXT_PUBLIC_AGENT_URL_VALUE="${{ github.ref_name == 'main' && 'http://3.214.66.146:8000' || 'http://34.224.235.157:8000' }}"
+            if grep -q '^FRONTEND_IMAGE_TAG=' .env; then
+              sed -i "s#^FRONTEND_IMAGE_TAG=.*#FRONTEND_IMAGE_TAG=${{ github.sha }}#" .env
+            else
+              echo "FRONTEND_IMAGE_TAG=${{ github.sha }}" >> .env
+            fi
+            if grep -q '^NEXT_PUBLIC_AGENT_URL=' .env; then
+              sed -i "s#^NEXT_PUBLIC_AGENT_URL=.*#NEXT_PUBLIC_AGENT_URL=${NEXT_PUBLIC_AGENT_URL_VALUE}#" .env
+            else
+              echo "NEXT_PUBLIC_AGENT_URL=${NEXT_PUBLIC_AGENT_URL_VALUE}" >> .env
+            fi
+
             docker compose -f docker-compose.yml pull frontend
-            docker compose -f docker-compose.yml up -d frontend
+            docker compose -f docker-compose.yml up -d --no-deps frontend
 
             for i in $(seq 1 60); do
               curl -fsS http://localhost:3000 && exit 0
@@ -172,7 +199,7 @@ jobs:
 
   deploy-img-proc-mcp:
     needs: changes
-    if: needs.changes.outputs['img-proc-mcp'] == 'true'
+    if: needs.changes.outputs['img-proc-mcp'] == 'true' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -203,16 +230,27 @@ jobs:
             git checkout ${{ github.ref_name }}
             git reset --hard origin/${{ github.ref_name }}
 
-            export IMG_PROC_MCP_IMAGE_TAG=${{ github.sha }}
+            touch .env
+            if grep -q '^IMG_PROC_MCP_IMAGE_TAG=' .env; then
+              sed -i "s#^IMG_PROC_MCP_IMAGE_TAG=.*#IMG_PROC_MCP_IMAGE_TAG=${{ github.sha }}#" .env
+            else
+              echo "IMG_PROC_MCP_IMAGE_TAG=${{ github.sha }}" >> .env
+            fi
+
             docker compose -f docker-compose.yml pull img-proc-mcp
-            docker compose -f docker-compose.yml up -d img-proc-mcp
+            docker compose -f docker-compose.yml up -d --no-deps img-proc-mcp
 
             # img-proc-mcp has no /health endpoint - it's an MCP server, and a plain
             # GET to /mcp correctly returns 406 (it requires MCP protocol headers).
-            # Just check the port accepts connections at all, not for a 2xx status.
+            # curl -f treats any non-2xx (500, connection-refused, etc.) as failure,
+            # so a 406 from a healthy server still passes this check while a 500 or
+            # dead port correctly fails it - only 406 is special-cased as healthy.
             for i in $(seq 1 60); do
-              curl -sS -o /dev/null http://localhost:9000/mcp && exit 0
-              echo "Waiting for img-proc-mcp to be ready... ($i/60)"
+              status=$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:9000/mcp || echo "000")
+              if [ "$status" = "406" ] || { [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; }; then
+                exit 0
+              fi
+              echo "Waiting for img-proc-mcp to be ready... ($i/60, last status: $status)"
               sleep 1
             done
             echo "img-proc-mcp failed to become ready within 60 seconds"
