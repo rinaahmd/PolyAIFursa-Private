@@ -22,8 +22,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
-logging.getLogger("langchain").setLevel(logging.DEBUG)
-logging.getLogger("langchain_core").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 import httpx
@@ -73,18 +71,7 @@ def _normalized_chat_id() -> str:
 
 
 def _normalize_image_orientation(image_b64: str) -> str:
-    """Bake any EXIF orientation into the pixel grid once, right when an
-    upload first enters the system, and re-encode as PNG (which carries no
-    orientation-flag ambiguity). Every later consumer - YOLO's own detection
-    call, the agent's S3 persistence, img-proc-mcp's crop/paste - then agrees
-    on the same pixel grid, so a box measured by one of them lands on the
-    right region when used by another. Without this, a portrait phone photo
-    (stored as wide pixels + a "rotate on display" EXIF tag) could have YOLO
-    auto-rotate it internally for detection while the edit pipeline used the
-    raw, un-rotated pixels - producing boxes that don't match the image being
-    edited at all. Returns the input unchanged (rather than raising) if it
-    isn't valid image bytes; the actual decode error surfaces later at the
-    point that already handles it (e.g. detect_objects)."""
+    """Bake EXIF orientation into the pixels once on upload, so every later consumer agrees on the same grid."""
     try:
         image_bytes = base64.b64decode(image_b64)
         with Image.open(io.BytesIO(image_bytes)) as image:
@@ -97,23 +84,12 @@ def _normalize_image_orientation(image_b64: str) -> str:
         return image_b64
 
 
-# The result of the most recent edit for each chat, so edits build on each other
-# (blur, then rotate, rotates the blurred version) instead of every tool always
-# starting over from the original upload. Keyed by chat_id, not a ContextVar, for
-# the same reason as _processed_images below: tool calls run in a copied context,
-# so a write from inside one tool call would never be visible to the next one in
-# the same turn. Reset (popped) whenever chat() sees a genuinely new upload.
+# Most recent edit result per chat, so edits build on each other. Keyed by chat_id, not a ContextVar,
+# because tool calls run in a copied context (see _processed_images below).
 _current_working_image: dict[str, str] = {}
 
-# Set by chat() from _parse_object_reference_hints on the current user message,
-# keyed by chat_id -> operation name ("blur"/"rotate"/"flip"/"add_noise").
-# blur_object/rotate_object/flip_object/add_noise_object use the entry for
-# their own operation to OVERRIDE whatever label/rank_from_left/rank_from_right
-# the model passed - even after being told to just copy these values, the
-# model has been observed to still substitute the wrong object/number most of
-# the time (including mixing up which object goes with which edit, when a
-# single message requests several edits at once), so the parsed reference is
-# treated as ground truth rather than a suggestion.
+# Per-chat, per-operation object reference parsed by chat() from the user's wording; overrides the
+# model's own label/rank args, since the model has been observed to still get them wrong.
 _object_reference_hints_by_chat: dict[str, dict[str, dict]] = {}
 
 
@@ -122,13 +98,7 @@ def _current_image_s3_key(chat_id: str) -> str:
 
 
 def _scratch_base_s3_key(chat_id: str) -> str:
-    """One stable key per chat for staging 'the full image being worked on'
-    for an MCP call, and one below for 'the region in flight' during an
-    object-scoped crop -> operation -> paste chain. Reused (overwritten) on
-    every edit and every step, rather than a fresh S3 object per tool call -
-    the only thing that needs to persist between chat turns is
-    <chat_id>/current.png; these are purely in-flight handoff data for the
-    current request."""
+    """Stable per-chat staging key for an MCP call, reused on every edit (only current.png persists across turns)."""
     return f"{chat_id}/scratch/base.png"
 
 
@@ -137,53 +107,24 @@ def _scratch_region_s3_key(chat_id: str) -> str:
 
 
 def _get_current_image() -> Optional[str]:
-    """Resolve the image the next tool call should operate on, in order:
-    1. in-memory current image (this process already has it cached),
-    2. <chat_id>/current.png from S3 (durable copy from the last successful
-       edit - survives an agent restart or a request landing on a different
-       worker/instance),
-    3. the image carried on this request's own history (e.g. a fresh upload
-       this turn, before any edit or S3 write has happened for it),
-    4. give up - callers treat None as "no image was provided by the user."
-    """
+    """Resolve the image to operate on: in-memory cache, then S3, then this request's own history."""
     chat_id = _normalized_chat_id()
     cached = _current_working_image.get(chat_id)
     if cached is not None:
-        logger.info(
-            "_get_current_image: chat_id=%s source=in-memory bytes_len=%d",
-            chat_id, len(cached),
-        )
         return cached
 
     restored = _download_current_image_from_s3(chat_id)
     if restored is not None:
         _current_working_image[chat_id] = restored
-        logger.info(
-            "_get_current_image: chat_id=%s source=s3 key=%s bytes_len=%d",
-            chat_id, _current_image_s3_key(chat_id), len(restored),
-        )
         return restored
 
-    from_history = _current_image_b64.get()
-    logger.info(
-        "_get_current_image: chat_id=%s source=%s bytes_len=%s",
-        chat_id, "request-history" if from_history else "none",
-        len(from_history) if from_history else 0,
-    )
-    return from_history
+    return _current_image_b64.get()
 
 
-# Populated by detect_objects, read by blur_object/rotate_object/flip_object/add_noise_object
-# to resolve "the second dog" to actual pixel coordinates without asking the LLM to copy box
-# coordinates by hand. Keyed by chat_id for the same reason as _current_working_image above.
+# Populated by detect_objects; lets blur_object etc. resolve "the second dog" to a box in code.
 _detections_by_chat: dict[str, list[dict]] = {}
 
-# The (width, height) YOLO measured its boxes against for each chat's most
-# recent detect_objects call. Read by _resolve_object_box to scale a box if
-# the image being edited (e.g. after a resize, or a re-upload with different
-# pixel dimensions than what YOLO saw) no longer matches that size - without
-# this, a box computed for one image size would land on the wrong region, or
-# an oversized/undersized one, once applied to a differently-sized image.
+# (width, height) YOLO measured boxes against, for _resolve_object_box to rescale if it's changed since.
 _detection_image_size_by_chat: dict[str, tuple[int, int]] = {}
 
 
@@ -196,10 +137,8 @@ def _image_size(image_b64: str) -> Optional[tuple[int, int]]:
 
 
 def _upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "image/jpeg") -> None:
-    if not AWS_REGION:
-        raise RuntimeError("AWS_REGION environment variable is required")
-    if not AWS_S3_BUCKET:
-        raise RuntimeError("AWS_S3_BUCKET environment variable is required")
+    if not AWS_REGION or not AWS_S3_BUCKET:
+        raise RuntimeError("AWS_REGION and AWS_S3_BUCKET environment variables are required")
 
     s3_client = boto3.client("s3", region_name=AWS_REGION)
     s3_client.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=data, ContentType=content_type)
@@ -217,45 +156,25 @@ def _download_bytes_from_s3(s3_key: str) -> Optional[bytes]:
         return None
 
 
-def _persist_png_to_s3(image_b64: str, s3_key: str, label: str) -> None:
-    """Best-effort write-through - persistence failures (e.g. S3 unreachable)
-    must not fail the caller's request. `label` is just for the log line.
-    The MCP server always returns base64-encoded PNG bytes (see
-    services/img-proc-mcp/app.py's _encode), so decoding here and uploading
-    with ContentType="image/png" stores the actual image, not text."""
+def _persist_current_image_to_s3(chat_id: str, image_b64: str) -> None:
+    """Best-effort write-through - persistence failures must not fail the caller's request."""
+    s3_key = _current_image_s3_key(chat_id)
     try:
         _upload_bytes_to_s3(base64.b64decode(image_b64), s3_key, content_type="image/png")
     except RuntimeError:
-        logger.warning("Skipping %s S3 persistence: S3 is not configured", label)
+        logger.warning("Skipping current image S3 persistence: S3 is not configured")
     except (BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError, binascii.Error, ValueError):
-        logger.exception("Failed to persist %s to S3 (key=%s)", label, s3_key)
-
-
-def _persist_current_image_to_s3(chat_id: str, image_b64: str) -> None:
-    """So the current image survives an agent restart or a request landing on
-    a different worker. The in-memory copy set by the caller is still
-    authoritative for the rest of this process's lifetime regardless of
-    whether this S3 write succeeds."""
-    _persist_png_to_s3(image_b64, _current_image_s3_key(chat_id), "current image")
-
-
-def _download_bytes_from_s3_as_b64(s3_key: str) -> Optional[str]:
-    data = _download_bytes_from_s3(s3_key)
-    if data is None:
-        return None
-    return base64.b64encode(data).decode("utf-8")
+        logger.exception("Failed to persist current image to S3 (key=%s)", s3_key)
 
 
 def _download_current_image_from_s3(chat_id: str) -> Optional[str]:
-    return _download_bytes_from_s3_as_b64(_current_image_s3_key(chat_id))
+    data = _download_bytes_from_s3(_current_image_s3_key(chat_id))
+    return base64.b64encode(data).decode("utf-8") if data is not None else None
 
 
 def _delete_current_image_from_s3(chat_id: str) -> bool:
-    """Returns True if the delete call completed (including a harmless
-    "already doesn't exist" case - S3 DeleteObject is idempotent and does not
-    error on a missing key), False if S3 isn't configured or the call itself
-    raised. Callers log this so a reset that silently failed to take effect
-    is visible instead of assumed to have worked."""
+    """Unused by the reset path on purpose (missing DeleteObject IAM permission caused a stale-image bug);
+    kept for test_new_upload_does_not_depend_on_s3_delete_succeeding."""
     if not AWS_REGION or not AWS_S3_BUCKET:
         return False
     s3_client = boto3.client("s3", region_name=AWS_REGION)
@@ -268,9 +187,7 @@ def _delete_current_image_from_s3(chat_id: str) -> bool:
 
 
 def _fetch_detections(prediction_id: str) -> list[dict]:
-    """Fetch per-object bounding boxes for a prediction. /predict itself only
-    returns labels, not boxes - the box coordinates live behind a separate
-    GET /prediction/{uid} call, same as _fetch_annotated_image below."""
+    """/predict returns labels only; box coordinates live behind a separate GET /prediction/{uid} call."""
     try:
         with httpx.Client(timeout=10.0) as client:
             response = client.get(f"{YOLO_SERVICE_URL}/prediction/{prediction_id}")
@@ -292,11 +209,8 @@ def _fetch_detections(prediction_id: str) -> list[dict]:
 
 
 def _add_left_right_rank(detections: list[dict]) -> None:
-    """Add rank_from_left/rank_from_right (1-based) to each detection, ranked
-    among objects sharing the same label, ordered by horizontal center. Doing
-    this comparison in code - rather than asking the LLM to compare several
-    raw box coordinates by itself - is what makes "the second dog from the
-    right" resolve reliably instead of depending on the model's arithmetic."""
+    """Rank each detection among same-label objects by horizontal center, so "second dog from
+    the right" resolves in code instead of relying on the model's arithmetic."""
     by_label: dict[str, list[dict]] = {}
     for detection in detections:
         by_label.setdefault(detection["label"], []).append(detection)
@@ -313,14 +227,11 @@ def _add_left_right_rank(detections: list[dict]) -> None:
 def detect_objects() -> str:
     """Detect and identify objects in the image provided by the user using YOLO object detection.
 
-    The result includes a "detections" list, each with an "index", "label",
-    "score", "box" ([left, top, right, bottom] in pixels), "rank_from_left",
-    and "rank_from_right" (1-based, computed among objects sharing the same
-    label). You do not need to read or compare these rank values yourself -
-    to edit a specific object (e.g. "the second dog from the right"), call
-    blur_object/rotate_object/flip_object/add_noise_object directly with
-    label="dog" and rank_from_right=2, copied straight from the user's
-    wording. Do not try to resolve this to an index yourself.
+    Result includes a "detections" list with "label", "box", "rank_from_left",
+    "rank_from_right" per object. To edit a specific one (e.g. "the second dog
+    from the right"), call blur_object/rotate_object/flip_object/add_noise_object
+    with label="dog", rank_from_right=2 copied straight from the user's wording -
+    do not resolve this to an index yourself.
     """
     image_b64 = _get_current_image()
     if not image_b64:
@@ -329,21 +240,17 @@ def detect_objects() -> str:
     try:
         image_bytes = base64.b64decode(image_b64)
     except (binascii.Error, ValueError) as exc:
-        logger.exception("detect_objects: invalid base64 image encoding")
         return json.dumps({"error": f"Invalid image encoding: {exc}"})
 
     prediction_id = str(uuid.uuid4())
     chat_id = _normalized_chat_id()
-    filename = "image.jpg"
-    image_s3_key = f"{chat_id}/{prediction_id}/original/{filename}"
+    image_s3_key = f"{chat_id}/{prediction_id}/original/image.jpg"
 
     try:
         _upload_bytes_to_s3(image_bytes, image_s3_key)
     except RuntimeError as exc:
-        logger.exception("detect_objects: S3 configuration error")
         return json.dumps({"error": f"S3 configuration error: {exc}"})
     except (BotoCoreError, ClientError, NoCredentialsError, PartialCredentialsError) as exc:
-        logger.exception("detect_objects: failed to upload image to S3")
         return json.dumps({"error": f"Failed to upload image to S3: {exc}"})
 
     try:
@@ -355,11 +262,9 @@ def detect_objects() -> str:
             response.raise_for_status()
         result = response.json()
     except httpx.HTTPStatusError as exc:
-        logger.exception("detect_objects: YOLO service returned non-2xx status")
         detail = exc.response.text if exc.response is not None else str(exc)
         return json.dumps({"error": f"YOLO service returned an error: {detail}"})
     except httpx.HTTPError as exc:
-        logger.exception("detect_objects: failed HTTP call to YOLO service")
         return json.dumps({"error": f"Failed to call YOLO service: {exc}"})
 
     detections = _fetch_detections(prediction_id)
@@ -372,21 +277,13 @@ def detect_objects() -> str:
     else:
         _detection_image_size_by_chat.pop(chat_id, None)
 
-    logger.info(
-        "detect_objects chat_id=%s prediction_id=%s image_size=%sx%s detections=%d labels_scores_boxes=%s",
-        chat_id, prediction_id, image_width, image_height, len(detections),
-        [(d["label"], d["score"], d["box"]) for d in detections],
-    )
-
     result["detections"] = detections
     return json.dumps(result)
 
 
 def _extract_mcp_text(result: Any) -> str:
-    """MCP tool results can come back as a plain string or as a list of
-    content blocks (e.g. [{"type": "text", "text": "..."}]) - unwrap either
-    shape without touching the raw payload (no LLM-text sanitization here,
-    since this may carry base64 image bytes)."""
+    """Unwrap an MCP result (plain string, or list of {"type": "text", "text": ...} blocks) with no sanitization -
+    this may carry base64 image bytes."""
     if isinstance(result, str):
         return result
     if isinstance(result, list):
@@ -401,12 +298,7 @@ def _extract_mcp_text(result: Any) -> str:
 
 
 async def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
-    """Call an img-proc-mcp tool. All tools take S3 key(s) in `arguments`
-    (input_s3_key + output_s3_key, or base_s3_key/region_s3_key/output_s3_key
-    for paste) and return a plain output_s3_key string - no image bytes cross
-    the agent<->MCP call itself. MCP downloads the input(s) from S3, does the
-    pixel op, uploads the result to the given output_s3_key (overwriting
-    whatever was already there), and hands back that same key."""
+    """Call an img-proc-mcp tool by S3 key(s) - no image bytes cross the agent<->MCP call itself."""
     client = MultiServerMCPClient(
         {
             "img-proc": {
@@ -421,24 +313,13 @@ async def _call_mcp_tool(tool_name: str, arguments: dict) -> str:
     return _extract_mcp_text(result)
 
 
-# Tool calls run in a copied context (LangChain's tracing machinery), so a
-# ContextVar written inside a tool never propagates back to run_agent's
-# context. Stash processed image bytes in a plain dict instead, keyed by a
-# small id the tool hands back in its (LLM-visible) JSON output - the same
-# side-channel trick detect_objects/prediction_id/annotated_image already use.
+# Tool calls run in a copied context, so a ContextVar write never propagates back to run_agent;
+# stash results here instead, keyed by an id the tool hands back in its JSON output.
 _processed_images: dict[str, str] = {}
 
 
 async def _call_mcp_object_op(operation: str, arguments: dict, chat_id: str, input_s3_key: str, box: list) -> str:
-    """crop -> operation -> paste, all via S3 keys: MCP crops just the
-    bounding-box region out of the full image (so only that small region -
-    not the whole image - ever gets downloaded again for the blur/rotate/etc
-    step), transforms it, then pastes the transformed region back into the
-    full image. Every step writes to one of two well-known per-chat scratch
-    keys (overwritten in place), not a fresh S3 object per call - see
-    _scratch_base_s3_key/_scratch_region_s3_key. Returns the S3 key of the
-    final, full-size composited image (the same key as input_s3_key, since
-    paste's output overwrites it)."""
+    """crop -> operation -> paste via S3 keys. Returns input_s3_key, since paste overwrites it in place."""
     left, top, right, bottom = (int(round(v)) for v in box)
     region_s3_key = _scratch_region_s3_key(chat_id)
     await _call_mcp_tool(
@@ -459,11 +340,7 @@ async def _call_mcp_object_op(operation: str, arguments: dict, chat_id: str, inp
 
 
 def _scale_box(box: list, from_size: tuple[int, int], to_size: tuple[int, int]) -> list:
-    """Scale a [left, top, right, bottom] box proportionally from the image
-    size it was measured against to a different current image size (e.g. the
-    image was resized between detect_objects and this edit, or - before the
-    EXIF-normalization fix - the two pipelines silently disagreed on
-    orientation/dimensions). A no-op when the sizes already match."""
+    """Scale a box proportionally between two image sizes (e.g. image was resized since detect_objects)."""
     from_width, from_height = from_size
     to_width, to_height = to_size
     if from_width <= 0 or from_height <= 0:
@@ -479,18 +356,8 @@ def _scale_box(box: list, from_size: tuple[int, int], to_size: tuple[int, int]) 
 def _resolve_object_box(
     label: str, rank_from_left: int | None, rank_from_right: int | None, current_image_size: Optional[tuple[int, int]]
 ) -> tuple[list | None, str | None]:
-    """Resolve (label, rank) to a box, entirely in code. We deliberately do NOT
-    ask the LLM to compare box coordinates or pick a raw index itself - even
-    when handed pre-computed rank_from_left/rank_from_right values, this small
-    model has been observed to state the correct rank in its own reasoning and
-    then still pick the wrong object. Reducing its job to "translate the
-    phrase 'second from the right' into rank_from_right=2" - a literal
-    wording-to-number copy, not a comparison across a list - is reliable.
-
-    If the image currently being edited has different pixel dimensions than
-    what YOLO measured this box against (_detection_image_size_by_chat), the
-    box is scaled proportionally before being returned, so it still lands on
-    the right region of the current image."""
+    """Resolve (label, rank) to a box entirely in code - the model has been observed to still pick the
+    wrong object even given pre-computed ranks. Rescales if the image size no longer matches YOLO's."""
     chat_id = _normalized_chat_id()
     candidates = [d for d in _detections_by_chat.get(chat_id, []) if d["label"] == label]
     if not candidates:
@@ -505,10 +372,6 @@ def _resolve_object_box(
     box = match["box"]
     detection_size = _detection_image_size_by_chat.get(chat_id)
     if detection_size is not None and current_image_size is not None and detection_size != current_image_size:
-        logger.warning(
-            "Scaling box for chat_id=%s: detection was measured at %s but current image is %s",
-            chat_id, detection_size, current_image_size,
-        )
         box = _scale_box(box, detection_size, current_image_size)
     return box, None
 
@@ -520,17 +383,15 @@ def _run_image_op(
     rank_from_left: int | None = None,
     rank_from_right: int | None = None,
 ) -> str:
+    """Choke point every blur/rotate/flip/resize/crop/add_noise tool routes through: resolves the current
+    image, stages it in S3, calls img-proc-mcp, downloads the result, updates the chat's working image."""
     chat_id = _normalized_chat_id()
     image_b64 = _get_current_image()
     if not image_b64:
         return json.dumps({"error": "No image was provided by the user."})
 
     if label is not None:
-        # chat() already parsed the user's actual wording into a hint with
-        # plain Python - that's ground truth. Override whatever the model
-        # passed rather than trust it, since the model has been observed to
-        # still get the number wrong (or mix up which object goes with which
-        # edit) even when told to just copy the hint.
+        # chat()'s parsed hint is ground truth - override the model's args with it.
         hint = _object_reference_hints_by_chat.get(chat_id, {}).get(operation)
         if hint is not None:
             label = hint["label"]
@@ -545,10 +406,6 @@ def _run_image_op(
             return json.dumps({"error": error})
 
     try:
-        # Stage the current image in S3 so img-proc-mcp can pull it by key -
-        # the agent<->MCP call itself carries only that key, never the bytes.
-        # One stable key per chat, overwritten on every edit - not a fresh S3
-        # object per call.
         input_s3_key = _scratch_base_s3_key(chat_id)
         _upload_bytes_to_s3(base64.b64decode(image_b64), input_s3_key, content_type="image/png")
 
@@ -571,9 +428,6 @@ def _run_image_op(
 
     _current_working_image[chat_id] = result_b64  # so the next edit builds on this one
     operation_id = str(uuid.uuid4())
-    # The only S3 write that needs to persist between chat turns - everything
-    # upstream of this (the scratch base/region keys) was just handoff data
-    # for this one request and gets overwritten by the next edit.
     _persist_current_image_to_s3(chat_id, result_b64)
     _processed_images[operation_id] = result_b64
     result = {"status": "ok", "operation": operation, "operation_id": operation_id, **arguments}
@@ -781,8 +635,6 @@ IMAGE_OP_TOOL_NAMES = {
 def _profile_to_dict(profile: Any) -> dict[str, Any]:
     if isinstance(profile, dict):
         return profile
-    if profile is None:
-        return {}
 
     for method_name in ("model_dump", "dict"):
         method = getattr(profile, method_name, None)
@@ -802,6 +654,7 @@ def _profile_to_dict(profile: Any) -> dict[str, Any]:
 
 
 def _coerce_int(value: Any) -> int | None:
+    """bools are deliberately rejected since isinstance(True, int) is True in Python."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -816,15 +669,16 @@ def _coerce_int(value: Any) -> int | None:
 
 
 def _pick_first_int(data: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    """keys covers different providers' naming conventions, e.g. "input_tokens" vs "inputTokens"."""
     for key in keys:
-        if key in data:
-            value = _coerce_int(data.get(key))
-            if value is not None:
-                return value
+        value = _coerce_int(data.get(key))
+        if value is not None:
+            return value
     return None
 
 
 def validate_model_profile(model_obj: Any, model_name: str) -> dict[str, Any]:
+    """Raises RuntimeError unless the model declares tool_calling=True - this agent needs it to function."""
     profile = _profile_to_dict(getattr(model_obj, "profile", None))
 
     if profile.get("tool_calling") is not True:
@@ -832,8 +686,7 @@ def validate_model_profile(model_obj: Any, model_name: str) -> dict[str, Any]:
             f"Model '{model_name}' is incompatible: missing required feature 'tool_calling=True' in llm.profile."
         )
 
-    # Some providers/version pairs do not expose structured_output in profile.
-    # We only enforce it when the key exists.
+    # Only enforce structured_output when the key exists - some providers don't expose it.
     if "structured_output" in profile and profile.get("structured_output") is not True:
         raise RuntimeError(
             f"Model '{model_name}' is incompatible: missing required feature 'structured_output=True' in llm.profile."
@@ -847,34 +700,11 @@ def _extract_usage_metadata(response: AIMessage) -> dict[str, int | None]:
     if not isinstance(usage, dict):
         return {"input": None, "output": None, "total": None}
 
-    input_tokens = _pick_first_int(
-        usage,
-        (
-            "input_tokens",
-            "inputTokens",
-            "input_token_count",
-            "inputTokenCount",
-        ),
-    )
-    output_tokens = _pick_first_int(
-        usage,
-        (
-            "output_tokens",
-            "outputTokens",
-            "output_token_count",
-            "outputTokenCount",
-        ),
-    )
-    total_tokens = _pick_first_int(
-        usage,
-        (
-            "total_tokens",
-            "totalTokens",
-            "total_token_count",
-            "totalTokenCount",
-        ),
-    )
-    return {"input": input_tokens, "output": output_tokens, "total": total_tokens}
+    return {
+        "input": _pick_first_int(usage, ("input_tokens", "inputTokens", "input_token_count", "inputTokenCount")),
+        "output": _pick_first_int(usage, ("output_tokens", "outputTokens", "output_token_count", "outputTokenCount")),
+        "total": _pick_first_int(usage, ("total_tokens", "totalTokens", "total_token_count", "totalTokenCount")),
+    }
 
 
 def _sum_optional(current: int | None, addition: int | None) -> int | None:
@@ -893,7 +723,6 @@ rate_limiter = InMemoryRateLimiter(
 )
 
 llm = None
-llm_profile: dict[str, Any] = {}
 llm_max_input_tokens: int | None = None
 llm_with_tools = None
 
@@ -910,7 +739,6 @@ def _initialize_llm() -> None:
     globals().update(
         {
             "llm": initialized_llm,
-            "llm_profile": initialized_profile,
             "llm_max_input_tokens": _coerce_int(initialized_profile.get("max_input_tokens")),
             "llm_with_tools": initialized_llm.bind_tools(list(TOOLS.values())),
         }
@@ -929,24 +757,14 @@ def _stringify_content(content) -> str:
     if isinstance(content, list):
         text_parts = []
         for item in content:
-            item_text = _content_item_text(item)
-            if item_text:
-                text_parts.append(item_text)
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                text_parts.append(item["text"])
         return _sanitize_response_text("\n".join(text_parts))
     if content is None:
         return ""
     return _sanitize_response_text(str(content))
-
-
-def _content_item_text(item: Any) -> str:
-    if isinstance(item, str):
-        return item
-    if isinstance(item, dict):
-        text = item.get("text")
-        if isinstance(text, str):
-            return text
-        return ""
-    return ""
 
 
 def _sanitize_response_text(text: str) -> str:
@@ -960,14 +778,11 @@ def _sanitize_response_text(text: str) -> str:
 
 
 def _parse_tool_json(content) -> Optional[dict]:
-    text = _stringify_content(content)
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(_stringify_content(content))
     except (json.JSONDecodeError, TypeError):
         return None
-    if isinstance(parsed, dict):
-        return parsed
-    return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _fetch_annotated_image(prediction_id: str) -> Optional[str]:
@@ -981,29 +796,18 @@ def _fetch_annotated_image(prediction_id: str) -> Optional[str]:
         return None
 
 
-
-
 class ContentBlockedError(Exception):
-    """Raised when Bedrock refused to produce a usable response for reasons
-    outside this code's control - either its own in-band content filter
-    (a normal 200 response whose text says the reply was blocked, with zero
-    tool calls) or a thrown ClientError (a real Guardrail intervention,
-    ValidationException, etc). Carries a `block_kind` used to pick the
-    frontend-facing message and to decide whether the deterministic fallback
-    parser should take over."""
+    """Raised when Bedrock refuses a response - an in-band content filter (200 response, zero tool
+    calls) or a thrown ClientError (Guardrail, ValidationException, etc)."""
 
     def __init__(self, block_kind: str, detail: str, tools_called: Optional[list[str]] = None):
         self.block_kind = block_kind  # "input_image" | "text_prompt" | "model_output" | "guardrail" | "other"
         self.detail = detail
-        # Tools the agent had already run THIS turn before the block happened -
-        # confirms whether blocking occurred before or after tool execution.
-        self.tools_called = tools_called or []
+        self.tools_called = tools_called or []  # tools already run this turn before the block
         super().__init__(detail)
 
 
-# Safe, specific messages shown to the user - never includes exc.detail
-# (which may echo back parts of the AWS error message) so nothing from the
-# provider's internal error text reaches the frontend unfiltered.
+# Never includes exc.detail (may echo AWS error text) so nothing provider-internal reaches the frontend.
 _BLOCK_KIND_MESSAGES = {
     "input_image": "The provider blocked the uploaded image.",
     "text_prompt": "The provider blocked the text instruction.",
@@ -1013,20 +817,14 @@ _BLOCK_KIND_MESSAGES = {
 }
 
 
-# AWS error codes/message substrings that indicate the request was rejected
-# for image content specifically, vs. text/prompt content, vs. a configured
-# Guardrail. Bedrock does not always give a clean single field for this, so
-# classification is necessarily best-effort pattern matching on the message.
+# Best-effort message-substring classification - Bedrock has no clean single field for block reason.
 _IMAGE_BLOCK_MARKERS = ("image", "vision", "unsafe image", "media type")
 _GUARDRAIL_MARKERS = ("guardrail",)
 _PROMPT_BLOCK_MARKERS = ("content policy", "content filter", "harmful", "prompt")
 
 
 def _classify_client_error(exc: ClientError) -> ContentBlockedError:
-    """Turn a botocore ClientError from a Bedrock call into a classified
-    ContentBlockedError, without ever including the request's image bytes
-    (this only ever looks at `exc.response['Error']`, which is Bedrock's own
-    short message - it does not echo request bodies/credentials back)."""
+    """Classify a Bedrock ClientError. Only looks at exc.response['Error'], never the request's image bytes."""
     error = exc.response.get("Error", {}) if hasattr(exc, "response") else {}
     error_code = error.get("Code", "Unknown")
     error_message = error.get("Message", str(exc))
@@ -1050,21 +848,9 @@ def _classify_client_error(exc: ClientError) -> ContentBlockedError:
 
 
 def _invoke_with_content_filter_retry(llm_with_tools, messages: list, max_retries: int = 4) -> AIMessage:
-    """Bedrock's own content-safety layer has been observed to block a
-    response to some multi-step edit requests intermittently - the exact
-    same messages can succeed on a retry a moment later. Retry a few times
-    before giving up, since this is nondeterministic and out of this code's
-    control (it isn't something our prompt or tool design can fix).
-
-    Two distinct failure shapes are handled:
-    - In-band refusal: a normal (200) AIMessage whose text says the reply was
-      blocked, with response_metadata['stopReason'] == 'content_filtered' (or
-      the older text-matching fallback for responses that don't set it) and
-      zero tool_calls. Retried up to max_retries times.
-    - A thrown ClientError (real Guardrail intervention, ValidationException,
-      etc): never silently retried into an unhandled 500 - classified and
-      re-raised as ContentBlockedError so the caller can log full AWS detail
-      and fall back to the deterministic parser."""
+    """Bedrock's content-safety layer intermittently blocks some multi-step edit requests - the same
+    messages can succeed on retry. In-band refusals (200, zero tool_calls) are retried up to max_retries;
+    a thrown ClientError is classified and re-raised as ContentBlockedError instead."""
     attempts = 0
     while True:
         attempts += 1
@@ -1090,13 +876,8 @@ def _invoke_with_content_filter_retry(llm_with_tools, messages: list, max_retrie
 
 
 def run_agent(history: list, max_iterations: int = 10) -> dict:
-    """
-    Simple ReAct loop:
-      1. Send messages to the LLM.
-      2. If the LLM requests tool calls, execute them and append results.
-      3. Repeat until the LLM returns a plain text response.
-      4. Stop after max_iterations to avoid infinite loops.
-    """
+    """Simple ReAct loop: invoke LLM, run any requested tools, repeat until a plain text response or
+    max_iterations. Raises ContentBlockedError if Bedrock blocks the request."""
     messages = [SystemMessage(content=SYSTEM_PROMPT)] + history
     start_time = time.perf_counter()
     iterations = 0
@@ -1117,9 +898,7 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         try:
             response: AIMessage = _invoke_with_content_filter_retry(active_llm_with_tools, messages)
         except ContentBlockedError as exc:
-            # Attach the tools already run THIS turn before re-raising, so the
-            # caller (chat()) can log/decide fallback eligibility based on
-            # whether the block happened before or after any tool executed.
+            # So chat() can decide fallback eligibility by whether tools ran before the block.
             exc.tools_called = list(tools_called)
             logger.error(
                 "run_agent: content block after %d iteration(s), tools_called_before_block=%s, block_kind=%s",
@@ -1132,13 +911,9 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
         total_output_tokens = _sum_optional(total_output_tokens, usage["output"])
         total_tokens = _sum_optional(total_tokens, usage["total"])
 
-        if llm_max_input_tokens is not None and usage["input"] is not None:
-            near_limit_threshold = int(llm_max_input_tokens * 0.9)
-            if usage["input"] >= near_limit_threshold:
-                token_limit_risk = True
+        if llm_max_input_tokens is not None and usage["input"] is not None and usage["input"] >= int(llm_max_input_tokens * 0.9):
+            token_limit_risk = True
 
-        print("TOOL CALLS:", response.tool_calls)
-        print("CONTENT:", response.content)
         messages.append(response)
 
         # No tool calls, the model produced its final answer
@@ -1154,11 +929,10 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
 
             tool_fn = TOOLS.get(tool_name)
             if tool_fn is None:
-                tool_result = ToolMessage(
+                messages.append(ToolMessage(
                     tool_call_id=tool_call.get("id", "unknown"),
                     content=json.dumps({"error": f"Unknown tool: {tool_name}"}),
-                )
-                messages.append(tool_result)
+                ))
                 continue
 
             tool_result = None
@@ -1186,17 +960,14 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
                 if parsed:
                     operation_id = parsed.get("operation_id")
                     if isinstance(operation_id, str) and operation_id:
-                        # Overwrite, don't accumulate - each edit builds on the last, so
-                        # the final one already reflects every edit made this turn.
+                        # Overwrite, don't accumulate - each edit builds on the last.
                         processed_image = _processed_images.pop(operation_id, processed_image)
     else:
         context_limit_exceeded = True
         final_response = "Agent stopped because it reached the maximum number of tool iterations."
 
     if token_limit_risk:
-        logging.warning(
-            "Model input token usage was near or above max_input_tokens for at least one loop iteration."
-        )
+        logger.warning("Model input token usage was near or above max_input_tokens for at least one loop iteration.")
 
     return {
         "response": final_response,
@@ -1215,16 +986,16 @@ def run_agent(history: list, max_iterations: int = 10) -> dict:
     }
 
 
-
 app = FastAPI(title="Vision Agent")
 
 app.add_middleware(
     CORSMiddleware,
-   allow_origins=[
+    allow_origins=[
         "http://localhost:3000",
-        "http://34.224.235.157:3000","http://3.214.66.146:3000",
+        "http://34.224.235.157:3000", "http://3.214.66.146:3000",
         "http://rina-dev.fursa.click:3000",
-    ],    allow_methods=["POST", "GET"],
+    ],
+    allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
 
@@ -1258,11 +1029,8 @@ class ChatResponse(BaseModel):
     tokens_used: TokenUsage
 
 
-# Small tool-calling models can "pattern-lock" onto the phrasing of their own
-# prior replies (e.g. several "The image has been successfully X'd." in a row)
-# and start completing that template instead of calling a tool for a new
-# request. Only replay the most recent turns to the LLM to keep it grounded -
-# the original image is still recovered below by scanning the FULL history.
+# Small models can "pattern-lock" onto their own prior reply phrasing instead of calling a tool
+# for a new request, so only replay recent turns (the image is still recovered from full history).
 MAX_HISTORY_MESSAGES = 4
 
 _ORDINAL_WORDS = {
@@ -1275,20 +1043,12 @@ _ORDINAL_LABEL_PATTERN = re.compile(
     r"(?:detected\s+)?([a-zA-Z]+)",
     re.IGNORECASE,
 )
-# "the <label>", used when there's no ordinal, just a side (e.g. "the person on the right").
-# Skips over "last"/"detected" so "the last detected person" still captures "person", not "last".
+# "the <label>", e.g. "the person on the right"; skips "last"/"detected" so it still captures "person".
 _LABEL_ONLY_PATTERN = re.compile(r"\bthe\s+(?:last\s+)?(?:detected\s+)?([a-zA-Z]+)\b", re.IGNORECASE)
-# Accepts "from/on/to/in the left/right" - covers "second dog from the right",
-# "the person on the right", "the person to the left", "the person in the right", etc.
 _DIRECTION_PATTERN = re.compile(r"\b(?:from|on|to|in)\s+the\s+(left|right)\b", re.IGNORECASE)
-# "last" is a rank word like the ordinals, but unlike them it names the highest
-# rank in a direction rather than a fixed number, so it can't live in
-# _ORDINAL_WORDS (whose values are literal integers resolved without knowing
-# how many objects of that label exist).
+# "last" names the extreme of a side rather than a fixed number, so it can't live in _ORDINAL_WORDS.
 _LAST_WORD_PATTERN = re.compile(r"\blast\b", re.IGNORECASE)
-# One keyword per object-scoped operation, used to split a multi-edit message
-# into per-operation clauses (e.g. "...add noise to X and blur Y" has one
-# clause for add_noise, one for blur).
+# One keyword per object-scoped operation, to split a multi-edit message into per-operation clauses.
 _OPERATION_KEYWORDS = {
     "add_noise": ("noise", "salt", "pepper"),
     "blur": ("blur",),
@@ -1306,16 +1066,9 @@ def _singularize(word: str) -> str:
 
 
 def _parse_object_reference_in_clause(clause: str) -> Optional[dict]:
-    """Best-effort parse of a single edit clause (e.g. 'blur the second dog
-    from the right', or 'the person on the right') into a
-    {label, rank_from_left, rank_from_right} reference.
-
-    This exists because the small tool-calling model has been observed to
-    mistranslate even a plain ordinal word like "second" into the wrong
-    integer most of the time, and to mix up which object goes with which
-    edit when a message requests several edits at once. Parsing each clause
-    in plain Python and overriding the model's own arguments with the result
-    is far more reliable than asking it to work this out itself."""
+    """Parse one edit clause (e.g. 'blur the second dog from the right') into a
+    {label, rank_from_left, rank_from_right} reference in plain Python - the model has been
+    observed to mistranslate ordinals and mix up objects across edits, so this overrides its args."""
     direction_match = _DIRECTION_PATTERN.search(clause)
     direction = direction_match.group(1).lower() if direction_match else None
 
@@ -1324,11 +1077,7 @@ def _parse_object_reference_in_clause(clause: str) -> Optional[dict]:
         if label_match:
             label = _singularize(label_match.group(1))
             if label not in _NON_OBJECT_LABELS:
-                # "last" names the extreme of whichever side is stated, it does
-                # NOT reverse that side - "the last person on the right" still
-                # means the rightmost person, same as "the person on the right"
-                # with no "last" at all. With no direction given, "last"
-                # defaults to reading order, i.e. the rightmost one.
+                # "last" names the extreme of the stated side, doesn't reverse it; defaults to rightmost.
                 return {
                     "label": label,
                     "rank_from_left": 1 if direction == "left" else None,
@@ -1367,11 +1116,8 @@ def _parse_object_reference_in_clause(clause: str) -> Optional[dict]:
 
 
 def _parse_object_reference_hints(text: str) -> dict[str, dict]:
-    """Split a message into clauses (on 'and') and parse each clause's object
-    reference, keyed by the operation (blur/rotate/flip/add_noise) mentioned
-    in that clause - so a single message requesting several different edits
-    on different objects resolves each one independently instead of a single
-    reference bleeding into every edit in the message."""
+    """Split on 'and' and parse each clause's object reference, keyed by its operation - so a multi-edit
+    message resolves each edit independently instead of one reference bleeding into all of them."""
     hints: dict[str, dict] = {}
     for clause in re.split(r"\band\b", text, flags=re.IGNORECASE):
         clause_lower = clause.lower()
@@ -1400,31 +1146,17 @@ _OBJECT_TOOL_BY_OPERATION = {
 
 
 def _extract_clause_number(clause: str) -> Optional[float]:
-    """Pull the first decimal/integer literal out of a clause, e.g. "noise
-    0.6" -> 0.6, "blur radius 3" -> 3.0. Returns None when the clause names
-    no number, so the tool's own default (radius=2.0, amount=0.05) applies -
-    same as when the LLM path omits the argument."""
+    """First decimal/integer literal in a clause, e.g. "noise 0.6" -> 0.6, or None (tool default applies)."""
     match = re.search(r"\b\d+(?:\.\d+)?\b", clause)
     return float(match.group()) if match else None
 
 
 def _run_deterministic_fallback(chat_id: str, text: str) -> dict:
-    """Parse flip/blur/add_noise clauses out of `text` with the same plain-Python
-    parsing already used to override the LLM's own tool arguments
-    (_parse_object_reference_hints/_parse_object_reference_in_clause), and call
-    the matching blur_object/flip_object/add_noise_object (or the whole-image
-    variant, if the clause names no object) tool functions directly - no LLM
-    call at all. Used only when Bedrock has refused to produce a usable
-    response; this performs exactly the operations the user's own words
-    specify, nothing more, nothing invented.
-
-    rotate_image/rotate_object/resize_image/crop_image are intentionally not
-    covered - the existing regex parser only recognizes blur/flip/add_noise
-    keywords (_OPERATION_KEYWORDS), matching the tools this fallback exists
-    for per the task."""
+    """Parse flip/blur/add_noise clauses out of `text` and call the matching tool functions directly -
+    no LLM call at all. Used only when Bedrock refuses a response. rotate/resize/crop are not covered;
+    the regex parser only recognizes blur/flip/add_noise keywords."""
     chat_token = _current_chat_id.set(chat_id)
     try:
-        clauses = re.split(r"\band\b", text, flags=re.IGNORECASE)
         tools_called: list[str] = []
         processed_image: Optional[str] = None
         performed: list[str] = []
@@ -1432,7 +1164,7 @@ def _run_deterministic_fallback(chat_id: str, text: str) -> dict:
         needs_detection = False
 
         parsed_clauses: list[tuple[str, Optional[dict], Optional[float]]] = []
-        for clause in clauses:
+        for clause in re.split(r"\band\b", text, flags=re.IGNORECASE):
             clause_lower = clause.lower()
             operation = next(
                 (op for op, keywords in _OPERATION_KEYWORDS.items() if any(k in clause_lower for k in keywords)),
@@ -1460,8 +1192,7 @@ def _run_deterministic_fallback(chat_id: str, text: str) -> dict:
         annotated_image: Optional[str] = None
         if needs_detection:
             tools_called.append(detect_objects.name)
-            raw = detect_objects.invoke({})
-            parsed = _parse_tool_json(raw)
+            parsed = _parse_tool_json(detect_objects.invoke({}))
             if parsed:
                 candidate_id = parsed.get("prediction_uid")
                 if isinstance(candidate_id, str) and candidate_id:
@@ -1486,8 +1217,7 @@ def _run_deterministic_fallback(chat_id: str, text: str) -> dict:
                 kwargs["amount"] = number
 
             tools_called.append(tool_fn.name)
-            raw = tool_fn.invoke(kwargs)
-            parsed = _parse_tool_json(raw)
+            parsed = _parse_tool_json(tool_fn.invoke(kwargs))
             if parsed and "error" not in parsed:
                 operation_id = parsed.get("operation_id")
                 if isinstance(operation_id, str) and operation_id:
@@ -1524,14 +1254,8 @@ def _run_deterministic_fallback(chat_id: str, text: str) -> dict:
 
 
 def _reorder_clauses_to_avoid_content_filter(text: str) -> str:
-    """Observed empirically: a message with several edit clauses ordered as
-    "add noise to X and flip Y and blur Z" reliably triggers Bedrock's own
-    content-safety filter (blocking the reply with zero tool calls), while
-    the identical edits succeed every time when the noise clause is moved to
-    the end - "flip Y and blur Z and add noise to X". This only changes what
-    we send the model, not the message shown in the chat transcript, and
-    each clause is still resolved to its own object independently regardless
-    of order (see _parse_object_reference_hints)."""
+    """Move add_noise clause(s) to the end - empirically, noise-before-other-edits reliably triggers
+    Bedrock's content filter, moving it to the end doesn't. Only changes what we send the model."""
     clauses = re.split(r"\band\b", text, flags=re.IGNORECASE)
     if len(clauses) < 2:
         return text
@@ -1547,20 +1271,12 @@ def _reorder_clauses_to_avoid_content_filter(text: str) -> str:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
+    """Detects a fresh upload, resets per-chat state for it, parses object reference hints, then
+    drives run_agent() - falling back to a deterministic parser if Bedrock blocks the request."""
     normalized_chat_id = (request.chat_id or "chat").strip() or "chat"
     newest_message = request.messages[-1] if request.messages else None
-    is_new_upload = (
-        newest_message is not None and newest_message.role == "user" and bool(newest_message.image_base64)
-    )
-    logger.info(
-        "chat: chat_id=%s new_upload_detected=%s message_count=%d",
-        normalized_chat_id, is_new_upload, len(request.messages),
-    )
+    is_new_upload = newest_message is not None and newest_message.role == "user" and bool(newest_message.image_base64)
     if is_new_upload:
-        # Normalize EXIF orientation once, right here, before this upload is
-        # used for anything (YOLO detection, S3 persistence, edits) - see
-        # _normalize_image_orientation for why every downstream consumer
-        # needs to agree on the same pixel grid.
         newest_message.image_base64 = _normalize_image_orientation(newest_message.image_base64)
 
     latest_image = None
@@ -1569,45 +1285,13 @@ def chat(request: ChatRequest):
             latest_image = msg.image_base64          # saved for detect_objects tool
 
     if is_new_upload:
-        # A brand new image was just uploaded this turn - start a fresh edit chain
-        # instead of continuing to build on whatever was edited before it.
-        #
-        # This OVERWRITES <chat_id>/current.png with the new upload's own bytes
-        # (via _persist_current_image_to_s3, which only needs s3:PutObject)
-        # rather than trying to DELETE the old object first. DeleteObject is a
-        # separate IAM permission from PutObject - on this deployment the
-        # role's policy only grants PutObject, so a delete-then-rely-on-absence
-        # approach silently left the previous chat's result in place at
-        # <chat_id>/current.png forever (confirmed live: DeleteObject calls
-        # were failing with AccessDenied, and the NEXT turn's _get_current_image
-        # would then read that stale object back from S3, before ever falling
-        # through to this request's own upload). Overwriting sidesteps the
-        # permission entirely - PutObject always replaces existing content.
-        had_cached_working_image = normalized_chat_id in _current_working_image
+        # Start a fresh edit chain: OVERWRITE current.png rather than DELETE it first - the S3 role only
+        # grants PutObject, and a delete-then-rely-on-absence approach left the old image in place forever.
         _current_working_image[normalized_chat_id] = newest_message.image_base64
         _persist_current_image_to_s3(normalized_chat_id, newest_message.image_base64)
-        # Also drop any detections/size/prediction state from a PREVIOUS image
-        # in this same chat_id - otherwise "blur the second dog" on the new
-        # image could resolve against boxes measured on the old one if the
-        # user asks for an object edit before detect_objects has run again
-        # for this upload. (_object_reference_hints_by_chat is handled
-        # separately below, re-derived from this turn's own message either way.)
-        had_detections = normalized_chat_id in _detections_by_chat
+        # Drop detection state from any previous image, so old boxes can't leak into a new-image edit.
         _detections_by_chat.pop(normalized_chat_id, None)
         _detection_image_size_by_chat.pop(normalized_chat_id, None)
-        logger.info(
-            "chat: chat_id=%s RESET current_working_image (was_cached=%s) to the new upload, "
-            "overwrote s3_key=%s, cleared detections (had_detections=%s)",
-            normalized_chat_id, had_cached_working_image, _current_image_s3_key(normalized_chat_id), had_detections,
-        )
-    else:
-        current_image_source = (
-            "in-memory" if normalized_chat_id in _current_working_image else "s3-or-history"
-        )
-        logger.info(
-            "chat: chat_id=%s no new upload this turn, continuing edit chain from %s",
-            normalized_chat_id, current_image_source,
-        )
 
     parsed_hints: dict[str, dict] = {}
     if newest_message is not None and newest_message.role == "user":
@@ -1615,8 +1299,7 @@ def chat(request: ChatRequest):
     if parsed_hints:
         _object_reference_hints_by_chat[normalized_chat_id] = parsed_hints
     else:
-        # Don't let hints from an earlier, unrelated turn leak into this one.
-        _object_reference_hints_by_chat.pop(normalized_chat_id, None)
+        _object_reference_hints_by_chat.pop(normalized_chat_id, None)  # don't leak a stale hint into this turn
 
     recent_messages = request.messages[-MAX_HISTORY_MESSAGES:]
     while recent_messages and recent_messages[0].role != "user":
@@ -1625,10 +1308,11 @@ def chat(request: ChatRequest):
     lc_messages = []
     for msg in recent_messages:
         if msg.role == "user":
-            if msg.image_base64:
-                reminder = "\n[An image was uploaded. Use the available tools to fulfill this request - do not claim to have performed an action without actually calling the matching tool.]"
-            else:
-                reminder = "\n[Use the available tools to fulfill this request - do not claim to have performed an action without actually calling the matching tool.]"
+            upload_note = "An image was uploaded. " if msg.image_base64 else ""
+            reminder = (
+                f"\n[{upload_note}Use the available tools to fulfill this request - do not claim to "
+                "have performed an action without actually calling the matching tool.]"
+            )
             message_text = msg.content
             if msg is newest_message:
                 message_text = _reorder_clauses_to_avoid_content_filter(message_text)
@@ -1654,11 +1338,8 @@ def chat(request: ChatRequest):
             normalized_chat_id, exc.block_kind, exc.tools_called, exc.detail,
         )
         fallback_result: Optional[dict] = None
-        # Only text/model-output blocks are eligible for the deterministic
-        # fallback - an input-image block means Bedrock rejected the image
-        # itself, which the fallback can't route around (it still needs YOLO
-        # to have a usable image), and "other"/unclassified errors are kept
-        # generic rather than guessed at.
+        # Only text/model-output blocks are eligible - an input-image block means the fallback has no
+        # usable image either, and "other"/unclassified errors are kept generic rather than guessed at.
         if exc.block_kind in ("text_prompt", "model_output") and newest_message is not None:
             try:
                 fallback_result = _run_deterministic_fallback(normalized_chat_id, newest_message.content)
