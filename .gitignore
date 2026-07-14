@@ -54,3 +54,8 @@ coverage.xml.claude/
 .claude/
 *.tsbuildinfo
 coverage.xml
+
+# Local tooling and generated files
+.claude/
+*.tsbuildinfo
+coverage.xml
