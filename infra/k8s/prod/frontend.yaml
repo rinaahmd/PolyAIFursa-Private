@@ -1,66 +1,64 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: yolo
-  namespace: dev
+  name: frontend
+  namespace: prod
   labels:
-    app: yolo
+    app: frontend
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: yolo
+      app: frontend
   template:
     metadata:
       labels:
-        app: yolo
+        app: frontend
     spec:
       containers:
-        - name: yolo
-          image: docker.io/rinaahmd/yolo-service:0.0.1
+        - name: frontend
+          image: docker.io/rinaahmd/frontend-service:0.0.2
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: 3000
           env:
-            - name: AWS_REGION
-              value: us-east-1
-            - name: AWS_S3_BUCKET
-              value: rina-polyai-images
+            - name: NEXT_PUBLIC_AGENT_URL
+              value: http://localhost:8000
           readinessProbe:
             httpGet:
-              path: /health
-              port: 8080
+              path: /
+              port: 3000
             initialDelaySeconds: 10
             periodSeconds: 10
-            timeoutSeconds: 3
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /health
-              port: 8080
+              path: /
+              port: 3000
             initialDelaySeconds: 30
             periodSeconds: 20
-            timeoutSeconds: 3
+            timeoutSeconds: 5
             failureThreshold: 3
           resources:
             requests:
-              cpu: 250m
-              memory: 512Mi
+              cpu: 100m
+              memory: 128Mi
             limits:
-              cpu: "1"
-              memory: 2Gi
+              cpu: 500m
+              memory: 512Mi
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: yolo
-  namespace: dev
+  name: frontend
+  namespace: prod
 spec:
   selector:
-    app: yolo
+    app: frontend
   ports:
     - name: http
       protocol: TCP
-      port: 8080
-      targetPort: 8080
+      port: 3000
+      targetPort: 3000
   type: ClusterIP

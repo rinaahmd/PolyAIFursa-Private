@@ -15,4 +15,4 @@ httpx
 pydantic
 boto3
 pillow
- 
+ prometheus-client

@@ -63,6 +63,18 @@ services:
     networks:
       - polyai-net
 
+  fluent-bit:
+    image: fluent/fluent-bit:4.2.7
+    container_name: fluent-bit
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - LOG_ENV=${LOG_ENV:-dev}
+    volumes:
+      - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/log:/var/log
+    restart: unless-stopped
+
   node-exporter:
     image: prom/node-exporter
     ports:
@@ -103,6 +115,7 @@ services:
       - monitoring-net
     depends_on:
       - prometheus
+
 
 networks:
   polyai-net:

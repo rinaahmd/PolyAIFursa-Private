@@ -59,3 +59,9 @@ coverage.xml
 .claude/
 *.tsbuildinfo
 coverage.xml
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
