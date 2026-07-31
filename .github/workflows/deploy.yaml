@@ -336,10 +336,30 @@ jobs:
             docker push rinaahmd/img-proc-mcp-service:${{ github.sha }}
           fi
 
+      - name: Validate K8s deploy secrets
+        env:
+          K8S_CONTROL_PLANE_HOST: ${{ secrets.K8S_CONTROL_PLANE_HOST }}
+          K8S_SSH_KEY: ${{ secrets.K8S_SSH_KEY }}
+        run: |
+          set -e
+
+          missing=""
+
+          [ -z "$K8S_CONTROL_PLANE_HOST" ] && \
+            missing="$missing K8S_CONTROL_PLANE_HOST"
+
+          [ -z "$K8S_SSH_KEY" ] && \
+            missing="$missing K8S_SSH_KEY"
+
+          if [ -n "$missing" ]; then
+            echo "Missing required secret(s):$missing"
+            exit 1
+          fi
+
       - name: Sync manifests and deploy to cluster
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.K8S_CONTROL_PLANE_IP }}
+          host: ${{ secrets.K8S_CONTROL_PLANE_HOST }}
           username: ubuntu
           key: ${{ secrets.K8S_SSH_KEY }}
           envs: GITHUB_SHA,GITHUB_REF_NAME
