@@ -131,6 +131,25 @@ jobs:
               echo "YOLO_IMAGE_TAG=${{ github.sha }}" >> .env
             fi
 
+            echo "--- disk usage before cleanup ---"
+            df -h /
+            docker system df
+
+            docker container prune -f
+            docker image prune -af
+            docker builder prune -af
+
+            echo "--- disk usage after cleanup ---"
+            df -h /
+            docker system df
+
+            AVAILABLE_BYTES=$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')
+
+            if [ "$AVAILABLE_BYTES" -lt 5368709120 ]; then
+              echo "Deployment stopped: less than 5 GB is available after cleanup"
+              exit 1
+            fi
+
             docker compose -f docker-compose.yml pull yolo
             docker compose -f docker-compose.yml up -d --no-deps yolo
 
@@ -356,7 +375,18 @@ jobs:
             exit 1
           fi
 
-      - name: Sync manifests and deploy to cluster
+      - name: Copy K8s manifests to control plane
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.K8S_CONTROL_PLANE_HOST }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          source: "infra/k8s/"
+          target: "/home/ubuntu/PolyAIFursa-Private-deploy"
+          strip_components: 0
+          rm: true
+
+      - name: Deploy to cluster
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.K8S_CONTROL_PLANE_HOST }}
@@ -366,17 +396,20 @@ jobs:
           script: |
             set -e
             NS="${{ github.ref_name == 'main' && 'prod' || 'dev' }}"
+            APP_DIR="/home/ubuntu/PolyAIFursa-Private-deploy"
 
-            if [ ! -d /home/ubuntu/PolyAIFursa-Private ]; then
-              git clone https://github.com/rinaahmd/PolyAIFursa-Private.git /home/ubuntu/PolyAIFursa-Private
+            if [ ! -d "$APP_DIR/infra/k8s/base" ]; then
+              echo "Missing Kubernetes base manifests"
+              exit 1
             fi
-            cd /home/ubuntu/PolyAIFursa-Private
-            git fetch origin
-            git checkout ${{ github.ref_name }}
-            git reset --hard origin/${{ github.ref_name }}
 
-            kubectl apply -f infra/k8s/base/
-            kubectl apply -f infra/k8s/$NS/
+            if [ ! -d "$APP_DIR/infra/k8s/$NS" ]; then
+              echo "Missing Kubernetes manifests for namespace: $NS"
+              exit 1
+            fi
+
+            kubectl apply -f "$APP_DIR/infra/k8s/base/"
+            kubectl apply -f "$APP_DIR/infra/k8s/$NS/"
 
             if [ "${{ needs.changes.outputs.agent }}" = "true" ]; then
               kubectl set image deployment/agent agent=rinaahmd/agent-service:${{ github.sha }} -n "$NS"
