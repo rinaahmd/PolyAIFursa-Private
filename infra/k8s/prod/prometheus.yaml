@@ -12,6 +12,12 @@ spec:
     matchLabels:
       app: prometheus
 
+  # The PVC below is ReadWriteOnce on a single EBS volume, so the old and
+  # new Pods must never run at once - RollingUpdate (the Deployment
+  # default) would try to attach the same volume to two Pods and fail.
+  strategy:
+    type: Recreate
+
   template:
     metadata:
       labels:

@@ -10,7 +10,6 @@ from typing import Any, Literal
 
 import boto3
 import requests
-from botocore.exceptions import ClientError
 from dateutil.parser import isoparse
 from fastmcp import FastMCP
 
@@ -101,56 +100,19 @@ def _read_s3_text(bucket: str, key: str) -> str:
     return content.decode("utf-8", errors="replace")
 
 
-def _container_metadata(
-    environment: Environment,
-) -> list[dict[str, str]]:
-    bucket = _s3_bucket(environment)
-    key = f"{environment}/container-metadata/containers.jsonl"
-
-    try:
-        text = _read_s3_text(bucket, key)
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-
-        if code in {"NoSuchKey", "404"}:
-            return []
-
-        raise
-
-    containers: list[dict[str, str]] = []
-
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        containers.append(
-            {
-                "id": str(item.get("ID", "")),
-                "name": str(item.get("Names", "")),
-                "image": str(item.get("Image", "")),
-                "status": str(item.get("Status", "")),
-            }
-        )
-
-    return containers
-
-
 def _list_recent_log_objects(
     environment: Environment,
     minutes: int,
+    since: datetime | None = None,
 ) -> list[dict[str, Any]]:
     bucket = _s3_bucket(environment)
     prefix = f"{environment}/logs/"
 
     # Fluent Bit may upload a file slightly after the log was created.
-    object_cutoff = datetime.now(timezone.utc) - timedelta(
-        minutes=minutes + 2
-    )
+    if since is not None:
+        object_cutoff = since - timedelta(minutes=2)
+    else:
+        object_cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes + 2)
 
     objects: list[dict[str, Any]] = []
 
@@ -185,25 +147,28 @@ def _parse_record_time(record: dict[str, Any]) -> datetime | None:
         return None
 
 
-def _extract_container_id(source_file: str) -> str | None:
-    match = re.search(
-        r"/containers/([0-9a-fA-F]+)/",
-        source_file,
-    )
-
+def _extract_service_from_key(key: str) -> str | None:
+    match = re.search(r"/service=([^/]+)/", key)
     return match.group(1) if match else None
 
 
 def _recent_log_records(
     environment: Environment,
     minutes: int,
+    service: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> list[dict[str, Any]]:
     bucket = _s3_bucket(environment)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    reference = since if since is not None else datetime.now(timezone.utc)
+    cutoff = reference - timedelta(minutes=minutes)
 
     records: list[dict[str, Any]] = []
 
-    for item in _list_recent_log_objects(environment, minutes):
+    for item in _list_recent_log_objects(environment, minutes, since=since):
+        if service is not None and _extract_service_from_key(item["Key"]) != service:
+            continue
+
         text = _read_s3_text(bucket, item["Key"])
 
         for line in text.splitlines():
@@ -220,6 +185,9 @@ def _recent_log_records(
             if record_time and record_time < cutoff:
                 continue
 
+            if until is not None and record_time and record_time > until:
+                continue
+
             record["_s3_key"] = item["Key"]
             records.append(record)
 
@@ -229,19 +197,6 @@ def _recent_log_records(
     )
 
     return records
-
-
-def _container_name(
-    full_container_id: str,
-    metadata: list[dict[str, str]],
-) -> str:
-    for container in metadata:
-        short_id = container["id"]
-
-        if short_id and full_container_id.startswith(short_id):
-            return container["name"]
-
-    return full_container_id[:12]
 
 
 @mcp.tool
@@ -300,31 +255,18 @@ def list_containers_shipping_logs(
     if minutes < 1 or minutes > 1440:
         raise ValueError("minutes must be between 1 and 1440")
 
-    metadata = _container_metadata(environment)
-    records = _recent_log_records(environment, minutes)
+    services: set[str] = set()
 
-    containers: dict[str, dict[str, Any]] = {}
-
-    for record in records:
-        source_file = str(record.get("source_file", ""))
-        container_id = _extract_container_id(source_file)
-
-        if not container_id:
-            continue
-
-        name = _container_name(container_id, metadata)
-
-        containers[container_id] = {
-            "container_id": container_id[:12],
-            "container_name": name,
-            "environment": environment,
-        }
+    for item in _list_recent_log_objects(environment, minutes):
+        service = _extract_service_from_key(item["Key"])
+        if service:
+            services.add(service)
 
     return {
         "environment": environment,
         "minutes": minutes,
-        "count": len(containers),
-        "containers": list(containers.values()),
+        "count": len(services),
+        "services": sorted(services),
     }
 
 
@@ -334,9 +276,12 @@ def get_container_logs(
     service: str,
     minutes: int = 5,
     max_lines: int = 200,
+    around_time: str | None = None,
 ) -> dict[str, Any]:
     """
     Return recent S3 logs for a service such as yolo, agent or frontend.
+    Pass around_time as an ISO 8601 string (e.g. "2026-07-01T12:00:00Z")
+    to query logs around a specific point in time instead of the last N minutes.
     """
 
     if minutes < 1 or minutes > 1440:
@@ -345,55 +290,30 @@ def get_container_logs(
     if max_lines < 1 or max_lines > 1000:
         raise ValueError("max_lines must be between 1 and 1000")
 
-    metadata = _container_metadata(environment)
-    service_lower = service.lower()
+    since: datetime | None = None
+    until: datetime | None = None
 
-    matched_containers = [
-        container
-        for container in metadata
-        if service_lower in container["name"].lower()
-        or service_lower in container["image"].lower()
-    ]
-
-    if not matched_containers:
-        available = [
-            container["name"]
-            for container in metadata
-        ]
-
-        raise ValueError(
-            f"No container matched service '{service}'. "
-            f"Available containers: {available}"
-        )
-
-    matching_ids = [
-        container["id"]
-        for container in matched_containers
-        if container["id"]
-    ]
+    if around_time is not None:
+        try:
+            pivot = isoparse(around_time).astimezone(timezone.utc)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid around_time: {exc}") from exc
+        since = pivot - timedelta(minutes=minutes)
+        until = pivot + timedelta(minutes=minutes)
 
     results: list[dict[str, Any]] = []
 
-    for record in _recent_log_records(environment, minutes):
-        source_file = str(record.get("source_file", ""))
-        container_id = _extract_container_id(source_file)
-
-        if not container_id:
-            continue
-
-        if not any(
-            container_id.startswith(short_id)
-            for short_id in matching_ids
-        ):
-            continue
-
+    for record in _recent_log_records(
+        environment,
+        minutes,
+        service=service.lower(),
+        since=since,
+        until=until,
+    ):
         results.append(
             {
                 "time": record.get("time") or record.get("date"),
-                "container": _container_name(
-                    container_id,
-                    metadata,
-                ),
+                "service": _extract_service_from_key(record.get("_s3_key", "")) or service,
                 "stream": record.get("stream"),
                 "log": str(record.get("log", "")).rstrip(),
                 "s3_key": record.get("_s3_key"),
@@ -404,6 +324,7 @@ def get_container_logs(
         "environment": environment,
         "service": service,
         "minutes": minutes,
+        "around_time": around_time,
         "count": len(results[-max_lines:]),
         "logs": results[-max_lines:],
     }

@@ -36,6 +36,7 @@ jobs:
             infra:
               - 'docker-compose.yml'
               - 'prometheus.yml'
+              - 'fluent-bit.conf'
             k8s:
               - 'infra/k8s/**'
 
@@ -258,6 +259,35 @@ jobs:
             done
             echo "img-proc-mcp failed to become ready within 60 seconds"
             exit 1
+
+  deploy-fluent-bit:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy fluent-bit
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ github.ref_name == 'main' && secrets.PROD_INSTANCE_IP || secrets.DEV_INSTANCE_IP }}
+          username: ubuntu
+          key: ${{ github.ref_name == 'main' && secrets.PROD_INSTANCE_SSH_KEY || secrets.DEV_INSTANCE_SSH_KEY }}
+          script: |
+            set -e
+            cd /home/ubuntu/PolyAIFursa-Private
+            git fetch origin
+            git checkout ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
+
+            touch .env
+            LOG_ENV_VALUE="${{ github.ref_name == 'main' && 'prod' || 'dev' }}"
+            if grep -q '^LOG_ENV=' .env; then
+              sed -i "s#^LOG_ENV=.*#LOG_ENV=${LOG_ENV_VALUE}#" .env
+            else
+              echo "LOG_ENV=${LOG_ENV_VALUE}" >> .env
+            fi
+
+            docker compose -f docker-compose.yml pull fluent-bit
+            docker compose -f docker-compose.yml up -d --no-deps fluent-bit
 
   deploy-k8s:
     needs: changes

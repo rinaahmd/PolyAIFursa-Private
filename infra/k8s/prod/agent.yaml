@@ -17,7 +17,11 @@ spec:
     spec:
       containers:
         - name: agent
-          image: docker.io/rinaahmd/agent-service:0.0.1
+          # 0.1.0 adds the K8s dev frontend NodePort origin to CORS
+          # allow_origins (services/agent/app.py) - rebuild required.
+          # Add the prod NodePort origin here (see infra/README.md) once a
+          # public prod host/DNS exists, then rebuild and bump this tag again.
+          image: docker.io/rinaahmd/agent-service:0.1.0
           ports:
             - name: http
               containerPort: 8000
@@ -69,4 +73,10 @@ spec:
       protocol: TCP
       port: 8000
       targetPort: 8000
-  type: ClusterIP
+      nodePort: 30801
+  # NodePort so the browser can reach the agent directly at
+  # http://<PROD_PUBLIC_HOST>:30801 (point prod DNS, once it exists, at the
+  # node's public IP). Switch to Ingress if a controller is added later.
+  # Uses a different nodePort (30801) than dev (30800) since dev and prod
+  # share one cluster's node port range.
+  type: NodePort

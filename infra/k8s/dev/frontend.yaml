@@ -17,13 +17,15 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: docker.io/rinaahmd/frontend-service:0.0.2
+          # Built with:
+          #   --build-arg NEXT_PUBLIC_AGENT_URL=http://rina-dev.fursa.click:30800
+          # NEXT_PUBLIC_* values are inlined into the JS bundle at `npm run build`
+          # time, so this image tag must be rebuilt whenever the dev agent's
+          # public URL changes. See infra/README.md for the build command.
+          image: docker.io/rinaahmd/frontend-service:dev-0.1.0
           ports:
             - name: http
               containerPort: 3000
-          env:
-            - name: NEXT_PUBLIC_AGENT_URL
-              value: http://localhost:8000
           readinessProbe:
             httpGet:
               path: /
@@ -61,4 +63,8 @@ spec:
       protocol: TCP
       port: 3000
       targetPort: 3000
-  type: ClusterIP
+      nodePort: 30300
+  # NodePort so the browser can reach the frontend at
+  # http://rina-dev.fursa.click:30300 (point that DNS record at the
+  # node's public IP). Switch to Ingress if a controller is added later.
+  type: NodePort

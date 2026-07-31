@@ -7,12 +7,18 @@ services:
     image: rinaahmd/frontend-service:${FRONTEND_IMAGE_TAG:-0.0.2}
     environment:
       - NEXT_PUBLIC_AGENT_URL=${NEXT_PUBLIC_AGENT_URL:-http://localhost:8000}
+      - LOG_CONTAINER_NAME=polyaifursa-private-frontend-1
     ports:
       - "3000:3000"
     networks:
       - polyai-net
     depends_on:
       - agent
+    logging:
+      driver: json-file
+      options:
+        env: "LOG_CONTAINER_NAME"
+        labels: "com.docker.compose.service"
 
   agent:
     build:
@@ -26,6 +32,7 @@ services:
       - MODEL=amazon.nova-micro-v1:0
       - AWS_REGION=us-east-1
       - AWS_S3_BUCKET=rina-polyai-images
+      - LOG_CONTAINER_NAME=polyaifursa-private-agent-1
     volumes:
       - ~/.aws:/root/.aws:ro
     networks:
@@ -33,6 +40,11 @@ services:
     depends_on:
       - yolo
       - img-proc-mcp
+    logging:
+      driver: json-file
+      options:
+        env: "LOG_CONTAINER_NAME"
+        labels: "com.docker.compose.service"
 
 
 
@@ -44,10 +56,16 @@ services:
     environment:
       - AWS_REGION=us-east-1
       - AWS_S3_BUCKET=rina-polyai-images
+      - LOG_CONTAINER_NAME=polyaifursa-private-yolo-1
     volumes:
       - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
+    logging:
+      driver: json-file
+      options:
+        env: "LOG_CONTAINER_NAME"
+        labels: "com.docker.compose.service"
 
   img-proc-mcp:
     build:
@@ -58,16 +76,23 @@ services:
     environment:
       - AWS_REGION=us-east-1
       - AWS_S3_BUCKET=rina-polyai-images
+      - LOG_CONTAINER_NAME=polyaifursa-private-img-proc-mcp-1
     volumes:
       - ~/.aws:/root/.aws:ro
     networks:
       - polyai-net
+    logging:
+      driver: json-file
+      options:
+        env: "LOG_CONTAINER_NAME"
+        labels: "com.docker.compose.service"
 
   fluent-bit:
     image: fluent/fluent-bit:4.2.7
     container_name: fluent-bit
     environment:
       - AWS_REGION=${AWS_REGION:-us-east-1}
+      - S3_LOGS_BUCKET=${S3_LOGS_BUCKET:-rinaahmd-polyai-logs-228281126655}
       - LOG_ENV=${LOG_ENV:-dev}
     volumes:
       - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro

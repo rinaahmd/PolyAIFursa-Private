@@ -6,7 +6,6 @@ metadata:
   labels:
     app: agent
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: agent
@@ -17,7 +16,9 @@ spec:
     spec:
       containers:
         - name: agent
-          image: docker.io/rinaahmd/agent-service:0.0.1
+          # 0.1.0 adds the K8s dev frontend NodePort origin to CORS
+          # allow_origins (services/agent/app.py) - rebuild required.
+          image: docker.io/rinaahmd/agent-service:0.1.0
           ports:
             - name: http
               containerPort: 8000
@@ -69,4 +70,8 @@ spec:
       protocol: TCP
       port: 8000
       targetPort: 8000
-  type: ClusterIP
+      nodePort: 30800
+  # NodePort so the browser can reach the agent directly at
+  # http://rina-dev.fursa.click:30800 (point that DNS record at the
+  # node's public IP). Switch to Ingress if a controller is added later.
+  type: NodePort

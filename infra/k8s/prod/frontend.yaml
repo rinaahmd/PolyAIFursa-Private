@@ -17,13 +17,18 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: docker.io/rinaahmd/frontend-service:0.0.2
+          # Built with:
+          #   --build-arg NEXT_PUBLIC_AGENT_URL=http://<PROD_PUBLIC_HOST>:30801
+          # No prod DNS name exists yet - substitute the real public host
+          # (e.g. a future prod.fursa.click, or the prod node's public IP)
+          # before building this image. NEXT_PUBLIC_* values are inlined into
+          # the JS bundle at `npm run build` time, so this image tag must be
+          # rebuilt whenever the prod agent's public URL changes.
+          # See infra/README.md for the build command.
+          image: docker.io/rinaahmd/frontend-service:prod-0.1.0
           ports:
             - name: http
               containerPort: 3000
-          env:
-            - name: NEXT_PUBLIC_AGENT_URL
-              value: http://localhost:8000
           readinessProbe:
             httpGet:
               path: /
@@ -61,4 +66,8 @@ spec:
       protocol: TCP
       port: 3000
       targetPort: 3000
-  type: ClusterIP
+      nodePort: 30301
+  # NodePort so the browser can reach the frontend at
+  # http://<PROD_PUBLIC_HOST>:30301 (point prod DNS, once it exists, at the
+  # node's public IP). Switch to Ingress if a controller is added later.
+  type: NodePort

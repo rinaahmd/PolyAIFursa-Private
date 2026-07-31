@@ -1005,6 +1005,11 @@ app.add_middleware(
         "http://34.224.235.157:3000", "http://3.214.66.146:3000",
         "http://rina-dev.fursa.click:3000",
         "http://localhost:13000","http://127.0.0.1:13000",
+        # Kubernetes dev/prod frontend NodePort origins (see
+        # infra/k8s/dev/frontend.yaml, infra/k8s/prod/frontend.yaml).
+        # Prod has no public DNS yet, so its NodePort origin (30301) isn't
+        # listed here - add it once a real host/DNS exists.
+        "http://rina-dev.fursa.click:30300",
     ],
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
