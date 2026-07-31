@@ -65,9 +65,9 @@ EC2 (Compose only): containers → Fluent Bit → S3 → Observability MCP → C
 
 ## 5. ⚠️ Things to double check / test
 
-- ~~**Bucket prefix mismatch**~~ — **fixed**: `fluent-bit.conf` again uses `/${LOG_ENV}/logs/...`, and the `deploy-fluent-bit` CI job now writes `LOG_ENV=dev`/`prod` into the remote `.env` based on branch (same pattern as the other deploy jobs), so dev/prod logs no longer collide under the same prefix.
-- **`docker-compose.yml:95`**: `S3_LOGS_BUCKET` env var — confirm this matches what `fluent-bit.conf` expects (`${S3_LOGS_BUCKET}` line 30) and that it's actually set on both EC2 hosts.
-- **MCP env vars in `.vscode/mcp.json`**: confirm `DEV_S3_LOGS_BUCKET`/`PROD_S3_LOGS_BUCKET` still line up with the new `/${LOG_ENV}/logs/host=.../service=.../` key shape (the MCP's `_extract_service_from_key` expects `/service=<name>/` literally in the key).
+- ~~**Bucket prefix mismatch**~~ — **fixed, and hardened further**: dev and prod logs now live in **two separate S3 buckets** (`rinaahmd-polyai-logs-228281126655` for dev, `rinaahmd-polyai-logs-prod-228281126655` for prod — same region/encryption/90-day lifecycle), not just different prefixes in one bucket. The `deploy-fluent-bit` CI job writes both `LOG_ENV` and `S3_LOGS_BUCKET` into the remote `.env` based on branch. `fluent-bit.conf` still keys `s3_key_format` off `${LOG_ENV}` too, as defense-in-depth in case a host's `.env` is ever misconfigured.
+- **`.vscode/mcp.json`**: `DEV_S3_LOGS_BUCKET`/`PROD_S3_LOGS_BUCKET` now point at the two separate buckets above — confirm the `observability` MCP server picks up the new value (reload VS Code / restart the MCP server).
+- **MCP env vars**: confirm `DEV_S3_LOGS_BUCKET`/`PROD_S3_LOGS_BUCKET` still line up with the `/${LOG_ENV}/logs/host=.../service=.../` key shape (the MCP's `_extract_service_from_key` expects `/service=<name>/` literally in the key).
 - ~~**Prod frontend**~~ — **partially addressed**: prod still has no public DNS, so no valid origin string exists to add yet; `services/agent/app.py` now has an explicit comment marking this as a TODO once prod DNS/host exists, instead of silently omitting it.
 - **HPA**: needs Metrics Server installed in-cluster or `TARGETS` will show `<unknown>`.
 - **New CI job `deploy-fluent-bit`**: needs `DEV_INSTANCE_IP`/`PROD_INSTANCE_IP` + SSH key secrets configured in GitHub — confirm they exist before merging.

@@ -280,10 +280,18 @@ jobs:
 
             touch .env
             LOG_ENV_VALUE="${{ github.ref_name == 'main' && 'prod' || 'dev' }}"
+            S3_LOGS_BUCKET_VALUE="${{ github.ref_name == 'main' && 'rinaahmd-polyai-logs-prod-228281126655' || 'rinaahmd-polyai-logs-228281126655' }}"
+
             if grep -q '^LOG_ENV=' .env; then
               sed -i "s#^LOG_ENV=.*#LOG_ENV=${LOG_ENV_VALUE}#" .env
             else
               echo "LOG_ENV=${LOG_ENV_VALUE}" >> .env
+            fi
+
+            if grep -q '^S3_LOGS_BUCKET=' .env; then
+              sed -i "s#^S3_LOGS_BUCKET=.*#S3_LOGS_BUCKET=${S3_LOGS_BUCKET_VALUE}#" .env
+            else
+              echo "S3_LOGS_BUCKET=${S3_LOGS_BUCKET_VALUE}" >> .env
             fi
 
             docker compose -f docker-compose.yml pull fluent-bit
