@@ -1,5 +1,9 @@
 name: Deploy Services
 
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
 on:
   push:
     branches:
@@ -424,7 +428,7 @@ jobs:
               kubectl set image deployment/img-proc-mcp img-proc-mcp=rinaahmd/img-proc-mcp-service:${{ github.sha }} -n "$NS"
             fi
 
-            kubectl rollout status deployment/agent -n "$NS" --timeout=120s || true
-            kubectl rollout status deployment/yolo -n "$NS" --timeout=120s || true
-            kubectl rollout status deployment/frontend -n "$NS" --timeout=120s || true
-            kubectl rollout status deployment/img-proc-mcp -n "$NS" --timeout=120s || true
+            kubectl rollout status deployment/agent -n "$NS" --timeout=120s
+            kubectl rollout status deployment/yolo -n "$NS" --timeout=120s
+            kubectl rollout status deployment/frontend -n "$NS" --timeout=120s
+            kubectl rollout status deployment/img-proc-mcp -n "$NS" --timeout=120s
