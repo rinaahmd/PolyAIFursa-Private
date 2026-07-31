@@ -84,6 +84,25 @@ jobs:
               echo "AGENT_IMAGE_TAG=${{ github.sha }}" >> .env
             fi
 
+            echo "--- disk usage before cleanup ---"
+            df -h /
+            docker system df
+
+            docker container prune -f
+            docker image prune -af
+            docker builder prune -af
+
+            echo "--- disk usage after cleanup ---"
+            df -h /
+            docker system df
+
+            AVAILABLE_BYTES=$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')
+
+            if [ "$AVAILABLE_BYTES" -lt 5368709120 ]; then
+              echo "Deployment stopped: less than 5 GB is available after cleanup"
+              exit 1
+            fi
+
             docker compose -f docker-compose.yml pull agent
             docker compose -f docker-compose.yml up -d --no-deps agent
 
@@ -213,6 +232,25 @@ jobs:
               echo "NEXT_PUBLIC_AGENT_URL=${NEXT_PUBLIC_AGENT_URL_VALUE}" >> .env
             fi
 
+            echo "--- disk usage before cleanup ---"
+            df -h /
+            docker system df
+
+            docker container prune -f
+            docker image prune -af
+            docker builder prune -af
+
+            echo "--- disk usage after cleanup ---"
+            df -h /
+            docker system df
+
+            AVAILABLE_BYTES=$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')
+
+            if [ "$AVAILABLE_BYTES" -lt 5368709120 ]; then
+              echo "Deployment stopped: less than 5 GB is available after cleanup"
+              exit 1
+            fi
+
             docker compose -f docker-compose.yml pull frontend
             docker compose -f docker-compose.yml up -d --no-deps frontend
 
@@ -262,6 +300,25 @@ jobs:
               sed -i "s#^IMG_PROC_MCP_IMAGE_TAG=.*#IMG_PROC_MCP_IMAGE_TAG=${{ github.sha }}#" .env
             else
               echo "IMG_PROC_MCP_IMAGE_TAG=${{ github.sha }}" >> .env
+            fi
+
+            echo "--- disk usage before cleanup ---"
+            df -h /
+            docker system df
+
+            docker container prune -f
+            docker image prune -af
+            docker builder prune -af
+
+            echo "--- disk usage after cleanup ---"
+            df -h /
+            docker system df
+
+            AVAILABLE_BYTES=$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')
+
+            if [ "$AVAILABLE_BYTES" -lt 5368709120 ]; then
+              echo "Deployment stopped: less than 5 GB is available after cleanup"
+              exit 1
             fi
 
             docker compose -f docker-compose.yml pull img-proc-mcp
@@ -315,6 +372,25 @@ jobs:
               sed -i "s#^S3_LOGS_BUCKET=.*#S3_LOGS_BUCKET=${S3_LOGS_BUCKET_VALUE}#" .env
             else
               echo "S3_LOGS_BUCKET=${S3_LOGS_BUCKET_VALUE}" >> .env
+            fi
+
+            echo "--- disk usage before cleanup ---"
+            df -h /
+            docker system df
+
+            docker container prune -f
+            docker image prune -af
+            docker builder prune -af
+
+            echo "--- disk usage after cleanup ---"
+            df -h /
+            docker system df
+
+            AVAILABLE_BYTES=$(df --output=avail -B1 / | tail -n 1 | tr -d ' ')
+
+            if [ "$AVAILABLE_BYTES" -lt 5368709120 ]; then
+              echo "Deployment stopped: less than 5 GB is available after cleanup"
+              exit 1
             fi
 
             docker compose -f docker-compose.yml pull fluent-bit
