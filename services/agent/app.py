@@ -1,3 +1,13 @@
+import time
+
+from fastapi.responses import Response
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Histogram,
+    generate_latest,
+)
+
 import asyncio
 import base64
 import binascii
@@ -994,6 +1004,12 @@ app.add_middleware(
         "http://localhost:3000",
         "http://34.224.235.157:3000", "http://3.214.66.146:3000",
         "http://rina-dev.fursa.click:3000",
+        "http://localhost:13000","http://127.0.0.1:13000",
+        # Kubernetes dev/prod frontend NodePort origins (see
+        # infra/k8s/dev/frontend.yaml, infra/k8s/prod/frontend.yaml).
+        # Prod has no public DNS yet, so its NodePort origin (30301) isn't
+        # listed here - add it once a real host/DNS exists.
+        "http://rina-dev.fursa.click:30300",
     ],
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
@@ -1269,8 +1285,53 @@ def _reorder_clauses_to_avoid_content_filter(text: str) -> str:
     return " and ".join(clause.strip() for clause in other_clauses + noise_clauses)
 
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
+
+AGENT_CHAT_REQUESTS = Counter(
+    "agent_chat_requests_total",
+    "Total number of Agent chat requests.",
+    ["status"],
+)
+
+AGENT_CHAT_LATENCY = Histogram(
+    "agent_chat_request_latency_seconds",
+    "Agent chat request latency in seconds.",
+    buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120),
+)
+
+AGENT_INPUT_TOKENS = Counter(
+    "agent_chat_input_tokens_total",
+    "Total number of input tokens used by Agent chat requests.",
+)
+
+AGENT_OUTPUT_TOKENS = Counter(
+    "agent_chat_output_tokens_total",
+    "Total number of output tokens used by Agent chat requests.",
+)
+
+
+def _token_metric_value(usage, *field_names: str) -> int:
+    """Read token counts safely even if the model uses different field names."""
+
+    if usage is None:
+        return 0
+
+    if hasattr(usage, "model_dump"):
+        values = usage.model_dump()
+    elif isinstance(usage, dict):
+        values = usage
+    else:
+        values = vars(usage)
+
+    for field_name in field_names:
+        value = values.get(field_name)
+
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+
+    return 0
+
+
+def _chat_impl(request: ChatRequest):
     """Detects a fresh upload, resets per-chat state for it, parses object reference hints, then
     drives run_agent() - falling back to a deterministic parser if Bedrock blocks the request."""
     normalized_chat_id = (request.chat_id or "chat").strip() or "chat"
@@ -1373,6 +1434,52 @@ def chat(request: ChatRequest):
     finally:
         _current_chat_id.reset(chat_token)
         _current_image_b64.reset(image_token)
+
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(request: ChatRequest):
+    started_at = time.perf_counter()
+
+    try:
+        result = _chat_impl(request)
+    except Exception:
+        AGENT_CHAT_REQUESTS.labels(status="error").inc()
+        raise
+    else:
+        AGENT_CHAT_REQUESTS.labels(status="success").inc()
+
+        AGENT_INPUT_TOKENS.inc(
+            _token_metric_value(
+                result.tokens_used,
+                "input_tokens",
+                "prompt_tokens",
+                "input",
+            )
+        )
+
+        AGENT_OUTPUT_TOKENS.inc(
+            _token_metric_value(
+                result.tokens_used,
+                "output_tokens",
+                "completion_tokens",
+                "output",
+            )
+        )
+
+        return result
+    finally:
+        AGENT_CHAT_LATENCY.observe(
+            time.perf_counter() - started_at
+        )
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
 
 
 @app.get("/health")

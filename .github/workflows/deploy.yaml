@@ -18,6 +18,7 @@ jobs:
       frontend: ${{ steps.filter.outputs.frontend }}
       img-proc-mcp: ${{ steps.filter.outputs['img-proc-mcp'] }}
       infra: ${{ steps.filter.outputs.infra }}
+      k8s: ${{ steps.filter.outputs.k8s }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -35,6 +36,9 @@ jobs:
             infra:
               - 'docker-compose.yml'
               - 'prometheus.yml'
+              - 'fluent-bit.conf'
+            k8s:
+              - 'infra/k8s/**'
 
   deploy-agent:
     needs: changes
@@ -255,3 +259,119 @@ jobs:
             done
             echo "img-proc-mcp failed to become ready within 60 seconds"
             exit 1
+
+  deploy-fluent-bit:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy fluent-bit
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ github.ref_name == 'main' && secrets.PROD_INSTANCE_IP || secrets.DEV_INSTANCE_IP }}
+          username: ubuntu
+          key: ${{ github.ref_name == 'main' && secrets.PROD_INSTANCE_SSH_KEY || secrets.DEV_INSTANCE_SSH_KEY }}
+          script: |
+            set -e
+            cd /home/ubuntu/PolyAIFursa-Private
+            git fetch origin
+            git checkout ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
+
+            touch .env
+            LOG_ENV_VALUE="${{ github.ref_name == 'main' && 'prod' || 'dev' }}"
+            S3_LOGS_BUCKET_VALUE="${{ github.ref_name == 'main' && 'rinaahmd-polyai-logs-prod-228281126655' || 'rinaahmd-polyai-logs-228281126655' }}"
+
+            if grep -q '^LOG_ENV=' .env; then
+              sed -i "s#^LOG_ENV=.*#LOG_ENV=${LOG_ENV_VALUE}#" .env
+            else
+              echo "LOG_ENV=${LOG_ENV_VALUE}" >> .env
+            fi
+
+            if grep -q '^S3_LOGS_BUCKET=' .env; then
+              sed -i "s#^S3_LOGS_BUCKET=.*#S3_LOGS_BUCKET=${S3_LOGS_BUCKET_VALUE}#" .env
+            else
+              echo "S3_LOGS_BUCKET=${S3_LOGS_BUCKET_VALUE}" >> .env
+            fi
+
+            docker compose -f docker-compose.yml pull fluent-bit
+            docker compose -f docker-compose.yml up -d --no-deps fluent-bit
+
+  deploy-k8s:
+    needs: changes
+    if: |
+      needs.changes.outputs.agent == 'true' ||
+      needs.changes.outputs.yolo == 'true' ||
+      needs.changes.outputs.frontend == 'true' ||
+      needs.changes.outputs['img-proc-mcp'] == 'true' ||
+      needs.changes.outputs.k8s == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push changed images
+        run: |
+          set -e
+          if [ "${{ needs.changes.outputs.agent }}" = "true" ]; then
+            docker build -t rinaahmd/agent-service:${{ github.sha }} services/agent
+            docker push rinaahmd/agent-service:${{ github.sha }}
+          fi
+          if [ "${{ needs.changes.outputs.yolo }}" = "true" ]; then
+            docker build -t rinaahmd/yolo-service:${{ github.sha }} services/yolo
+            docker push rinaahmd/yolo-service:${{ github.sha }}
+          fi
+          if [ "${{ needs.changes.outputs.frontend }}" = "true" ]; then
+            docker build -t rinaahmd/frontend-service:${{ github.sha }} services/frontend \
+              --build-arg NEXT_PUBLIC_AGENT_URL="${{ github.ref_name == 'main' && 'http://3.214.66.146:8000' || 'http://34.224.235.157:8000' }}"
+            docker push rinaahmd/frontend-service:${{ github.sha }}
+          fi
+          if [ "${{ needs.changes.outputs['img-proc-mcp'] }}" = "true" ]; then
+            docker build -t rinaahmd/img-proc-mcp-service:${{ github.sha }} services/img-proc-mcp
+            docker push rinaahmd/img-proc-mcp-service:${{ github.sha }}
+          fi
+
+      - name: Sync manifests and deploy to cluster
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.K8S_CONTROL_PLANE_IP }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          envs: GITHUB_SHA,GITHUB_REF_NAME
+          script: |
+            set -e
+            NS="${{ github.ref_name == 'main' && 'prod' || 'dev' }}"
+
+            if [ ! -d /home/ubuntu/PolyAIFursa-Private ]; then
+              git clone https://github.com/rinaahmd/PolyAIFursa-Private.git /home/ubuntu/PolyAIFursa-Private
+            fi
+            cd /home/ubuntu/PolyAIFursa-Private
+            git fetch origin
+            git checkout ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
+
+            kubectl apply -f infra/k8s/base/
+            kubectl apply -f infra/k8s/$NS/
+
+            if [ "${{ needs.changes.outputs.agent }}" = "true" ]; then
+              kubectl set image deployment/agent agent=rinaahmd/agent-service:${{ github.sha }} -n "$NS"
+            fi
+            if [ "${{ needs.changes.outputs.yolo }}" = "true" ]; then
+              kubectl set image deployment/yolo yolo=rinaahmd/yolo-service:${{ github.sha }} -n "$NS"
+            fi
+            if [ "${{ needs.changes.outputs.frontend }}" = "true" ]; then
+              kubectl set image deployment/frontend frontend=rinaahmd/frontend-service:${{ github.sha }} -n "$NS"
+            fi
+            if [ "${{ needs.changes.outputs['img-proc-mcp'] }}" = "true" ]; then
+              kubectl set image deployment/img-proc-mcp img-proc-mcp=rinaahmd/img-proc-mcp-service:${{ github.sha }} -n "$NS"
+            fi
+
+            kubectl rollout status deployment/agent -n "$NS" --timeout=120s || true
+            kubectl rollout status deployment/yolo -n "$NS" --timeout=120s || true
+            kubectl rollout status deployment/frontend -n "$NS" --timeout=120s || true
+            kubectl rollout status deployment/img-proc-mcp -n "$NS" --timeout=120s || true

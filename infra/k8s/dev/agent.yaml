@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+  namespace: dev
+  labels:
+    app: agent
+spec:
+  selector:
+    matchLabels:
+      app: agent
+  template:
+    metadata:
+      labels:
+        app: agent
+    spec:
+      containers:
+        - name: agent
+          # 0.1.0 adds the K8s dev frontend NodePort origin to CORS
+          # allow_origins (services/agent/app.py) - rebuild required.
+          image: docker.io/rinaahmd/agent-service:0.1.0
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: YOLO_SERVICE_URL
+              value: http://yolo:8080
+            - name: IMG_PROC_MCP_URL
+              value: http://img-proc-mcp:9000/mcp
+            - name: MODEL
+              value: amazon.nova-micro-v1:0
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_S3_BUCKET
+              value: rina-polyai-images
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 750m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent
+  namespace: dev
+spec:
+  selector:
+    app: agent
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000
+      targetPort: 8000
+      nodePort: 30800
+  # NodePort so the browser can reach the agent directly at
+  # http://rina-dev.fursa.click:30800 (point that DNS record at the
+  # node's public IP). Switch to Ingress if a controller is added later.
+  type: NodePort
