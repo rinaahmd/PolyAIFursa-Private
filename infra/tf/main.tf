@@ -37,3 +37,11 @@ module "vpc" {
     Terraform = "true"
   }
 }
+
+module "k8s_cluster" {
+  source = "./modules/k8s-cluster"
+
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.public_subnets
+  env        = var.env
+}
