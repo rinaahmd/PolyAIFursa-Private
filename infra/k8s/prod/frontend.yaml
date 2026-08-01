@@ -17,7 +17,9 @@ spec:
     spec:
       containers:
         - name: frontend
-          # Built with:
+          # prod-0.1.0 was never built/pushed to DockerHub (manifest unknown),
+          # so this pinned to 0.0.2, the last image that actually exists and
+          # runs, until prod-0.1.0 is built with:
           #   --build-arg NEXT_PUBLIC_AGENT_URL=http://<PROD_PUBLIC_HOST>:30801
           # No prod DNS name exists yet - substitute the real public host
           # (e.g. a future prod.fursa.click, or the prod node's public IP)
@@ -25,7 +27,7 @@ spec:
           # the JS bundle at `npm run build` time, so this image tag must be
           # rebuilt whenever the prod agent's public URL changes.
           # See infra/README.md for the build command.
-          image: docker.io/rinaahmd/frontend-service:prod-0.1.0
+          image: docker.io/rinaahmd/frontend-service:0.0.2
           ports:
             - name: http
               containerPort: 3000
