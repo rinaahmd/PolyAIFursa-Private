@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: img-proc-mcp
+  namespace: prod
+  labels:
+    app: img-proc-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: img-proc-mcp
+  template:
+    metadata:
+      labels:
+        app: img-proc-mcp
+    spec:
+      containers:
+        - name: img-proc-mcp
+          image: docker.io/rinaahmd/img-proc-mcp-service:0.0.1
+          ports:
+            - name: mcp
+              containerPort: 9000
+          env:
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_S3_BUCKET
+              value: rina-polyai-images
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: img-proc-mcp
+  namespace: prod
+spec:
+  selector:
+    app: img-proc-mcp
+  ports:
+    - name: mcp
+      protocol: TCP
+      port: 9000
+      targetPort: 9000
+  type: ClusterIP

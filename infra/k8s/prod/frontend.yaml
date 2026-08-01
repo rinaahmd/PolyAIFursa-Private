@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: prod
+  labels:
+    app: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          # Built with:
+          #   --build-arg NEXT_PUBLIC_AGENT_URL=http://<PROD_PUBLIC_HOST>:30801
+          # No prod DNS name exists yet - substitute the real public host
+          # (e.g. a future prod.fursa.click, or the prod node's public IP)
+          # before building this image. NEXT_PUBLIC_* values are inlined into
+          # the JS bundle at `npm run build` time, so this image tag must be
+          # rebuilt whenever the prod agent's public URL changes.
+          # See infra/README.md for the build command.
+          image: docker.io/rinaahmd/frontend-service:prod-0.1.0
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: prod
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      protocol: TCP
+      port: 3000
+      targetPort: 3000
+      nodePort: 30301
+  # NodePort so the browser can reach the frontend at
+  # http://<PROD_PUBLIC_HOST>:30301 (point prod DNS, once it exists, at the
+  # node's public IP). Switch to Ingress if a controller is added later.
+  type: NodePort

@@ -5,6 +5,7 @@ langchain
 langgraph
 langchain-core
 langchain-mcp-adapters
+mcp<2.0.0
 
 langchain[openai]
 langchain[anthropic]
@@ -15,4 +16,4 @@ httpx
 pydantic
 boto3
 pillow
- 
+ prometheus-client

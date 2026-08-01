@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yolo
+  namespace: prod
+  labels:
+    app: yolo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: yolo
+  template:
+    metadata:
+      labels:
+        app: yolo
+    spec:
+      containers:
+        - name: yolo
+          image: docker.io/rinaahmd/yolo-service:0.0.1
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_S3_BUCKET
+              value: rina-polyai-images
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yolo
+  namespace: prod
+spec:
+  selector:
+    app: yolo
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
