@@ -47,4 +47,21 @@ services/frontend/node_modules/
 services/frontend/out/
 
 
+coverage.xml.claude/
+*.tsbuildinfo
+
+# Local generated files
+.claude/
+*.tsbuildinfo
 coverage.xml
+
+# Local tooling and generated files
+.claude/
+*.tsbuildinfo
+coverage.xml
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
