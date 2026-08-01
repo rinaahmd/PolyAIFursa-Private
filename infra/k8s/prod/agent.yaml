@@ -17,11 +17,14 @@ spec:
     spec:
       containers:
         - name: agent
-          # 0.1.0 adds the K8s dev frontend NodePort origin to CORS
-          # allow_origins (services/agent/app.py) - rebuild required.
-          # Add the prod NodePort origin here (see infra/README.md) once a
-          # public prod host/DNS exists, then rebuild and bump this tag again.
-          image: docker.io/rinaahmd/agent-service:0.1.0
+          # agent-service:0.1.0 was never built/pushed (manifest unknown) -
+          # agent images are only ever tagged with the git commit SHA
+          # (see .github/workflows/deploy.yaml), so this pins to the SHA
+          # that's already built and confirmed running via Compose.
+          # Add the prod NodePort origin to CORS allow_origins in
+          # services/agent/app.py (see infra/README.md) once a public prod
+          # host/DNS exists, then rebuild and update this tag.
+          image: docker.io/rinaahmd/agent-service:5215304673881d12dd31d85e26230f3cd1c05fe2
           ports:
             - name: http
               containerPort: 8000
