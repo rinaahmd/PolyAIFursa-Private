@@ -20,3 +20,9 @@ variable "public_subnet_cidrs" {
   type        = list(string)
   default     = ["10.0.1.0/24", "10.0.2.0/24"]
 }
+
+variable "ssh_public_key_path" {
+  description = "Path to the local public key file used to create the cluster's AWS key pair"
+  type        = string
+  default     = "~/.ssh/rina-polyai-dev.pub"
+}

@@ -41,7 +41,9 @@ module "vpc" {
 module "k8s_cluster" {
   source = "./modules/k8s-cluster"
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.public_subnets
-  env        = var.env
+  vpc_id              = module.vpc.vpc_id
+  vpc_cidr            = var.vpc_cidr
+  subnet_ids          = module.vpc.public_subnets
+  ssh_public_key_path = var.ssh_public_key_path
+  env                 = var.env
 }

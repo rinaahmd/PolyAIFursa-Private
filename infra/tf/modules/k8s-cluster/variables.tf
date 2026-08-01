@@ -3,9 +3,19 @@ variable "vpc_id" {
   type        = string
 }
 
+variable "vpc_cidr" {
+  description = "CIDR block of the VPC, used to scope intra-VPC security group rules"
+  type        = string
+}
+
 variable "subnet_ids" {
   description = "IDs of the public subnets available to the cluster (control plane and workers)"
   type        = list(string)
+}
+
+variable "ssh_public_key_path" {
+  description = "Path to the local public key file used to create the cluster's AWS key pair"
+  type        = string
 }
 
 variable "env" {
