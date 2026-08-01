@@ -101,6 +101,11 @@ resource "aws_instance" "control_plane" {
   iam_instance_profile   = aws_iam_instance_profile.control_plane.name
   key_name               = aws_key_pair.control_plane_key.key_name
 
+  user_data = templatefile("${path.module}/templates/control_plane_user_data.sh.tpl", {
+    pod_network_cidr = "192.168.0.0/16"
+  })
+  user_data_replace_on_change = true
+
   root_block_device {
     volume_size = 20
     volume_type = "gp3"
