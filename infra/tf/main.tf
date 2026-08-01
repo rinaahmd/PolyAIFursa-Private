@@ -22,7 +22,7 @@ module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.8.1"
 
-  name = "polyai-k8s-vpc"
+  name = "rina-polyai-k8s-vpc"
   cidr = var.vpc_cidr
 
   azs            = slice(data.aws_availability_zones.available.names, 0, 2)
@@ -35,15 +35,20 @@ module "vpc" {
     Env       = var.env
     Project   = "PolyAI"
     Terraform = "true"
+    Owner     = "rina"
   }
 }
 
 module "k8s_cluster" {
   source = "./modules/k8s-cluster"
 
-  vpc_id              = module.vpc.vpc_id
-  vpc_cidr            = var.vpc_cidr
-  subnet_ids          = module.vpc.public_subnets
-  ssh_public_key_path = var.ssh_public_key_path
-  env                 = var.env
+  vpc_id                  = module.vpc.vpc_id
+  vpc_cidr                = var.vpc_cidr
+  subnet_ids              = module.vpc.public_subnets
+  ssh_public_key_path     = var.ssh_public_key_path
+  env                     = var.env
+  worker_instance_type    = var.worker_instance_type
+  worker_min_size         = var.worker_min_size
+  worker_max_size         = var.worker_max_size
+  worker_desired_capacity = var.worker_desired_capacity
 }

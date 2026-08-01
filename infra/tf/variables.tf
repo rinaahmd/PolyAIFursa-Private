@@ -26,3 +26,27 @@ variable "ssh_public_key_path" {
   type        = string
   default     = "~/.ssh/rina-polyai-dev.pub"
 }
+
+variable "worker_instance_type" {
+  description = "EC2 instance type for worker nodes"
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "worker_min_size" {
+  description = "Minimum number of worker nodes in the Auto Scaling Group"
+  type        = number
+  default     = 1
+}
+
+variable "worker_max_size" {
+  description = "Maximum number of worker nodes in the Auto Scaling Group"
+  type        = number
+  default     = 3
+}
+
+variable "worker_desired_capacity" {
+  description = "Desired number of worker nodes; set to 0 when the cluster is not in use to avoid cost"
+  type        = number
+  default     = 1
+}
