@@ -50,3 +50,9 @@ variable "worker_desired_capacity" {
   type        = number
   default     = 1
 }
+
+variable "ssm_join_command_path" {
+  description = "SSM parameter path where the current kubeadm join command is stored"
+  type        = string
+  default     = "/rina-polyai-k8s/join-command"
+}

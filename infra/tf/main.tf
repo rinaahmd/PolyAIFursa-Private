@@ -51,4 +51,6 @@ module "k8s_cluster" {
   worker_min_size         = var.worker_min_size
   worker_max_size         = var.worker_max_size
   worker_desired_capacity = var.worker_desired_capacity
+  region                  = var.region
+  ssm_join_command_path   = var.ssm_join_command_path
 }

@@ -60,6 +60,20 @@ resource "aws_iam_instance_profile" "control_plane" {
   role = aws_iam_role.control_plane.name
 }
 
+resource "aws_iam_role_policy" "control_plane_ssm_write_join_token" {
+  name = "rina-polyai-k8s-control-plane-ssm-write"
+  role = aws_iam_role.control_plane.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:PutParameter", "ssm:GetParameter"]
+      Resource = "arn:aws:ssm:${var.region}:*:parameter${var.ssm_join_command_path}"
+    }]
+  })
+}
+
 resource "aws_security_group" "control_plane" {
   name        = "rina-polyai-k8s-control-plane-sg"
   description = "Control plane: SSH from anywhere, all traffic within the VPC"
@@ -105,7 +119,9 @@ resource "aws_instance" "control_plane" {
   key_name               = aws_key_pair.control_plane_key.key_name
 
   user_data = templatefile("${path.module}/templates/control_plane_user_data.sh.tpl", {
-    pod_network_cidr = "192.168.0.0/16"
+    pod_network_cidr      = "192.168.0.0/16"
+    aws_region            = var.region
+    ssm_join_command_path = var.ssm_join_command_path
   })
   user_data_replace_on_change = true
 
@@ -164,6 +180,20 @@ resource "aws_iam_instance_profile" "worker" {
   role = aws_iam_role.worker.name
 }
 
+resource "aws_iam_role_policy" "worker_ssm_read_join_token" {
+  name = "rina-polyai-k8s-worker-ssm-read"
+  role = aws_iam_role.worker.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "ssm:GetParameter"
+      Resource = "arn:aws:ssm:${var.region}:*:parameter${var.ssm_join_command_path}"
+    }]
+  })
+}
+
 resource "aws_security_group" "worker" {
   name        = "rina-polyai-k8s-worker-sg"
   description = "Workers: SSH from anywhere, all traffic within the VPC"
@@ -211,6 +241,11 @@ resource "aws_launch_template" "worker" {
   }
 
   vpc_security_group_ids = [aws_security_group.worker.id]
+
+  user_data = base64encode(templatefile("${path.module}/templates/worker_user_data.sh.tpl", {
+    aws_region            = var.region
+    ssm_join_command_path = var.ssm_join_command_path
+  }))
 
   block_device_mappings {
     device_name = "/dev/sda1"
