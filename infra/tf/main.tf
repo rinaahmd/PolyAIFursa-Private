@@ -10,66 +10,47 @@ terraform {
 }
 
 provider "aws" {
-  region  = "us-east-1"
+  region  = var.region
   profile = "default"
 }
 
-resource "aws_instance" "polyai_dev" {
-  ami           = "ami-0b6d9d3d33ba97d99"
-  instance_type = "t2.nano"
-  key_name      = aws_key_pair.polyai_dev_key.key_name
+data "aws_availability_zones" "available" {
+  state = "available"
+}
 
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.8.1"
 
-  vpc_security_group_ids = [aws_security_group.polyai_dev_sg.id]
+  name = "rina-polyai-k8s-vpc"
+  cidr = var.vpc_cidr
+
+  azs            = slice(data.aws_availability_zones.available.names, 0, 2)
+  public_subnets = var.public_subnet_cidrs
+
+  map_public_ip_on_launch = true
+  enable_nat_gateway      = false
 
   tags = {
-    Name      = "rina-polyai-dev"
-    Env       = "dev"
-    Terraform = "true"
+    Env       = var.env
     Project   = "PolyAI"
+    Terraform = "true"
+    Owner     = "rina"
   }
 }
 
-resource "aws_security_group" "polyai_dev_sg" {
-  name        = "rina-polyai-dev-sg"
-  description = "Allow SSH and HTTP traffic"
+module "k8s_cluster" {
+  source = "./modules/k8s-cluster"
 
-  ingress {
-    description = "Allow SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "Allow HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    description = "Allow all outbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "rina-polyai-dev-sg"
-    Env  = "dev"
-  }
-}
-
-resource "aws_key_pair" "polyai_dev_key" {
-  key_name   = "rina-polyai-dev-key"
-  public_key = file(pathexpand("~/.ssh/rina-polyai-dev.pub"))
-
-  tags = {
-    Name = "rina-polyai-dev-key"
-    Env  = "dev"
-  }
+  vpc_id                  = module.vpc.vpc_id
+  vpc_cidr                = var.vpc_cidr
+  subnet_ids              = module.vpc.public_subnets
+  ssh_public_key_path     = var.ssh_public_key_path
+  env                     = var.env
+  worker_instance_type    = var.worker_instance_type
+  worker_min_size         = var.worker_min_size
+  worker_max_size         = var.worker_max_size
+  worker_desired_capacity = var.worker_desired_capacity
+  region                  = var.region
+  ssm_join_command_path   = var.ssm_join_command_path
 }
