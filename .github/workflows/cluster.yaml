@@ -88,6 +88,26 @@ jobs:
             exit 1
           fi
 
+      - name: Wait for control plane to finish initializing
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            set -e
+            for i in $(seq 1 60); do
+              if [ -f /home/ubuntu/.kube/config ]; then
+                echo "Control plane is ready"
+                exit 0
+              fi
+              echo "Waiting for kubeadm init to finish... ($i/60)"
+              sleep 10
+            done
+            echo "Timed out waiting for control plane to initialize"
+            exit 1
+
       - name: Install Calico (idempotent)
         uses: appleboy/ssh-action@v1
         with:
