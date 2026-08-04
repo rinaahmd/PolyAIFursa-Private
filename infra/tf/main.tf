@@ -44,7 +44,6 @@ module "k8s_cluster" {
   vpc_id                  = module.vpc.vpc_id
   vpc_cidr                = var.vpc_cidr
   subnet_ids              = module.vpc.public_subnets
-  ssh_public_key_path     = var.ssh_public_key_path
   env                     = var.env
   worker_instance_type    = var.worker_instance_type
   worker_min_size         = var.worker_min_size
