@@ -21,12 +21,6 @@ variable "public_subnet_cidrs" {
   default     = ["10.0.1.0/24", "10.0.2.0/24"]
 }
 
-variable "ssh_public_key_path" {
-  description = "Path to the local public key file used to create the cluster's AWS key pair"
-  type        = string
-  default     = "~/.ssh/rina-polyai-dev.pub"
-}
-
 variable "worker_instance_type" {
   description = "EC2 instance type for worker nodes"
   type        = string
