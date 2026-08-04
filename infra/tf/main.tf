@@ -7,6 +7,12 @@ terraform {
   }
 
   required_version = ">= 1.7.0"
+
+  backend "s3" {
+    bucket = "rina-polyai-k8s-tfstate-228281126655"
+    key    = "cluster.tfstate"
+    region = "us-east-1"
+  }
 }
 
 provider "aws" {
