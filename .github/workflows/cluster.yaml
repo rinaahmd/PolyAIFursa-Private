@@ -8,6 +8,10 @@ on:
         required: true
         default: "us-east-1"
 
+concurrency:
+  group: cluster-${{ github.event.inputs.region }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
