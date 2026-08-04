@@ -1,0 +1,90 @@
+name: Update Service Image Tag
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: write
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      agent: ${{ steps.filter.outputs.agent }}
+      yolo: ${{ steps.filter.outputs.yolo }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      img-proc-mcp: ${{ steps.filter.outputs['img-proc-mcp'] }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            agent:
+              - 'services/agent/**'
+            yolo:
+              - 'services/yolo/**'
+            frontend:
+              - 'services/frontend/**'
+            img-proc-mcp:
+              - 'services/img-proc-mcp/**'
+
+  update-image-tag:
+    needs: changes
+    if: |
+      needs.changes.outputs.agent == 'true' ||
+      needs.changes.outputs.yolo == 'true' ||
+      needs.changes.outputs.frontend == 'true' ||
+      needs.changes.outputs['img-proc-mcp'] == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build, push, and update manifests for changed services
+        run: |
+          set -e
+          NS="${{ github.ref_name == 'main' && 'prod' || 'dev' }}"
+
+          update_service() {
+            local service="$1"
+            local image="rinaahmd/${service}-service"
+            docker build -t "${image}:${{ github.sha }}" "services/${service}"
+            docker push "${image}:${{ github.sha }}"
+            sed -i "s#image: docker.io/${image}:.*#image: docker.io/${image}:${{ github.sha }}#" \
+              "infra/k8s/${NS}/${service}.yaml"
+          }
+
+          if [ "${{ needs.changes.outputs.agent }}" = "true" ]; then
+            update_service agent
+          fi
+          if [ "${{ needs.changes.outputs.yolo }}" = "true" ]; then
+            update_service yolo
+          fi
+          if [ "${{ needs.changes.outputs.frontend }}" = "true" ]; then
+            update_service frontend
+          fi
+          if [ "${{ needs.changes.outputs['img-proc-mcp'] }}" = "true" ]; then
+            update_service img-proc-mcp
+          fi
+
+      - name: Commit and push manifest changes
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add infra/k8s/
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit"
+            exit 0
+          fi
+          git commit -m "ci: update image tag(s) to ${{ github.sha }} [skip ci]"
+          git push origin "${{ github.ref_name }}"

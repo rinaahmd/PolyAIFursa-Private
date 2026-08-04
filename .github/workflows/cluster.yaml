@@ -1,0 +1,146 @@
+name: Provision and Bootstrap Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "AWS region / Terraform workspace to target"
+        required: true
+        default: "us-east-1"
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/tf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ github.event.inputs.region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Select workspace
+        run: terraform workspace select -or-create "${{ github.event.inputs.region }}"
+
+      - name: Terraform apply
+        run: |
+          terraform apply -auto-approve -input=false \
+            -var-file="tfvars/${{ github.event.inputs.region }}.tfvars"
+
+  bootstrap:
+    needs: provision
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/tf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ github.event.inputs.region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Select workspace
+        run: terraform workspace select "${{ github.event.inputs.region }}"
+
+      - name: Get control plane IP
+        id: cp
+        run: echo "ip=$(terraform output -raw control_plane_public_ip)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate bootstrap secrets
+        env:
+          K8S_SSH_KEY: ${{ secrets.K8S_SSH_KEY }}
+          ARGOCD_REPO_PAT: ${{ secrets.ARGOCD_REPO_PAT }}
+        run: |
+          set -e
+          missing=""
+          [ -z "$K8S_SSH_KEY" ] && missing="$missing K8S_SSH_KEY"
+          [ -z "$ARGOCD_REPO_PAT" ] && missing="$missing ARGOCD_REPO_PAT"
+          if [ -n "$missing" ]; then
+            echo "Missing required secret(s):$missing"
+            exit 1
+          fi
+
+      - name: Install Calico (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          script: |
+            set -e
+            kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+
+      - name: Install ArgoCD (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          script: |
+            set -e
+            kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --server-side --force-conflicts
+            kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -
+            kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Configure ArgoCD repo credentials (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          envs: ARGOCD_REPO_PAT
+          script: |
+            set -e
+            kubectl create secret generic polyai-repo -n argocd \
+              --from-literal=type=git \
+              --from-literal=url=https://github.com/rinaahmd/PolyAIFursa-Private.git \
+              --from-literal=username=rinaahmd \
+              --from-literal=password="$ARGOCD_REPO_PAT" \
+              --dry-run=client -o yaml \
+              | kubectl label --local -f - argocd.argoproj.io/secret-type=repository -o yaml \
+              | kubectl apply -f -
+
+      - name: Deploy ArgoCD Applications (idempotent)
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          source: "infra/argocd/applications/"
+          target: "/home/ubuntu/argocd-applications"
+          strip_components: 2
+
+      - name: Apply ArgoCD Applications
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          script: |
+            set -e
+            kubectl apply -f /home/ubuntu/argocd-applications/
