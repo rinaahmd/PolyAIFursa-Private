@@ -133,7 +133,7 @@ jobs:
           key: ${{ secrets.K8S_SSH_KEY }}
           source: "infra/argocd/applications/"
           target: "/home/ubuntu/argocd-applications"
-          strip_components: 2
+          strip_components: 3
 
       - name: Apply ArgoCD Applications
         uses: appleboy/ssh-action@v1
