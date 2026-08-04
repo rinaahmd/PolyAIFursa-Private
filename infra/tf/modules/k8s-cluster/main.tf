@@ -10,7 +10,7 @@ data "aws_ami" "ubuntu" {
 
 resource "aws_key_pair" "control_plane_key" {
   key_name   = "rina-polyai-k8s-control-plane-key"
-  public_key = file(pathexpand(var.ssh_public_key_path))
+  public_key = file("${path.module}/files/control-plane-key.pub")
 
   tags = {
     Env   = var.env

@@ -13,11 +13,6 @@ variable "subnet_ids" {
   type        = list(string)
 }
 
-variable "ssh_public_key_path" {
-  description = "Path to the local public key file used to create the cluster's AWS key pair"
-  type        = string
-}
-
 variable "env" {
   description = "Environment label used for tagging cluster resources"
   type        = string
