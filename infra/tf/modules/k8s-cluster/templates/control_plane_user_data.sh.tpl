@@ -64,12 +64,16 @@ cat <<'EOF' | tee /usr/local/bin/refresh-join-token.sh
 #!/bin/bash
 set -euxo pipefail
 JOIN_CMD=$(kubeadm token create --print-join-command)
-aws ssm put-parameter \
-  --region ${aws_region} \
-  --name "${ssm_join_command_path}" \
-  --type SecureString \
-  --value "$JOIN_CMD" \
-  --overwrite
+for i in 1 2 3; do
+  aws ssm put-parameter \
+    --region ${aws_region} \
+    --name "${ssm_join_command_path}" \
+    --type SecureString \
+    --value "$JOIN_CMD" \
+    --overwrite && exit 0
+  sleep 10
+done
+exit 1
 EOF
 chmod +x /usr/local/bin/refresh-join-token.sh
 

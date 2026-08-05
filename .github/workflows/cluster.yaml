@@ -94,15 +94,15 @@ jobs:
           host: ${{ steps.cp.outputs.ip }}
           username: ubuntu
           key: ${{ secrets.K8S_SSH_KEY }}
-          command_timeout: 10m
+          command_timeout: 20m
           script: |
             set -e
-            for i in $(seq 1 60); do
+            for i in $(seq 1 120); do
               if [ -f /home/ubuntu/.kube/config ]; then
                 echo "Control plane is ready"
                 exit 0
               fi
-              echo "Waiting for kubeadm init to finish... ($i/60)"
+              echo "Waiting for kubeadm init to finish... ($i/120)"
               sleep 10
             done
             echo "Timed out waiting for control plane to initialize"
