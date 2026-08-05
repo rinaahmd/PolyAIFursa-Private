@@ -47,11 +47,28 @@ unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install
 
 # --- Fetch the current join command from SSM and join the cluster ---
-JOIN_CMD=$(aws ssm get-parameter \
-  --region ${aws_region} \
-  --name "${ssm_join_command_path}" \
-  --with-decryption \
-  --query 'Parameter.Value' \
-  --output text)
+# Retries handle the race where a worker boots before the control plane's
+# token-refresh timer has written a token for the CURRENT cluster (e.g.
+# right after the control plane itself was just replaced) -- kubeadm join
+# then fails against a stale/unreachable API server. Up to 10 attempts,
+# 30s apart (5 min total), matches the control plane's own SSM refresh cadence.
+for i in $(seq 1 10); do
+  JOIN_CMD=$(aws ssm get-parameter \
+    --region ${aws_region} \
+    --name "${ssm_join_command_path}" \
+    --with-decryption \
+    --query 'Parameter.Value' \
+    --output text)
 
-eval "$JOIN_CMD"
+  if eval "$JOIN_CMD"; then
+    echo "Successfully joined the cluster"
+    exit 0
+  fi
+
+  echo "kubeadm join failed (attempt $i/10), resetting and retrying in 30s..."
+  kubeadm reset -f
+  sleep 30
+done
+
+echo "Failed to join the cluster after 10 attempts"
+exit 1
