@@ -55,6 +55,8 @@ kind: Service
 metadata:
   name: yolo
   namespace: prod
+  labels:
+    app: yolo
 spec:
   selector:
     app: yolo

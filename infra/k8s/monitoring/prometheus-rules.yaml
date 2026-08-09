@@ -1,0 +1,39 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: polyai-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: polyai.agent
+      rules:
+        - alert: AgentHighErrorRate
+          expr: |
+            (
+              sum(rate(agent_chat_requests_total{status="error"}[5m])) by (namespace)
+              /
+              sum(rate(agent_chat_requests_total[5m])) by (namespace)
+            ) > 0.1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Agent chat error rate is high in {{ $labels.namespace }}"
+            description: "More than 10% of agent /chat requests have failed over the last 5 minutes in namespace {{ $labels.namespace }}."
+
+    - name: polyai.yolo
+      rules:
+        - alert: YoloHighRequestLatency
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(http_request_duration_seconds_bucket{job="yolo"}[5m])) by (le, namespace)
+            ) > 2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Yolo p95 request latency is high in {{ $labels.namespace }}"
+            description: "95th percentile request latency for yolo has exceeded 2s over the last 5 minutes in namespace {{ $labels.namespace }}."

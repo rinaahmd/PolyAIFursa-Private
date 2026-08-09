@@ -215,6 +215,22 @@ resource "aws_security_group" "worker" {
     cidr_blocks = [var.vpc_cidr]
   }
 
+  ingress {
+    description     = "Ingress Controller HTTP NodePort from the ALB"
+    from_port       = var.ingress_http_node_port
+    to_port         = var.ingress_http_node_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  ingress {
+    description     = "Ingress Controller HTTPS NodePort from the ALB"
+    from_port       = var.ingress_https_node_port
+    to_port         = var.ingress_https_node_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
   egress {
     description = "All outbound traffic"
     from_port   = 0

@@ -53,3 +53,38 @@ variable "ssm_join_command_path" {
   type        = string
   default     = "/rina-polyai-k8s/join-command"
 }
+
+variable "ingress_http_node_port" {
+  description = "NodePort the Nginx Ingress Controller listens on for HTTP traffic"
+  type        = number
+  default     = 30080
+}
+
+variable "ingress_https_node_port" {
+  description = "NodePort the Nginx Ingress Controller listens on for HTTPS traffic"
+  type        = number
+  default     = 30443
+}
+
+variable "route53_zone_name" {
+  description = "Name of the shared, pre-existing Route 53 hosted zone to look up (not managed by this stack)"
+  type        = string
+  default     = "fursa.click"
+}
+
+variable "dns_record_name" {
+  description = "Fully qualified domain name to create in the shared hosted zone, pointing at the ALB (used for prod)"
+  type        = string
+  default     = "rina-polyai.fursa.click"
+}
+
+variable "dev_dns_record_name" {
+  description = "Fully qualified domain name for the dev environment, pointing at the same ALB"
+  type        = string
+  default     = "dev.rina-polyai.fursa.click"
+}
+
+variable "alert_email" {
+  description = "Email address subscribed to the alerting SNS topic; requires clicking the confirmation link AWS sends before alerts deliver"
+  type        = string
+}
