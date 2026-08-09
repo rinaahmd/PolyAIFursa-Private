@@ -40,3 +40,4 @@ alertmanager:
             sigv4:
               region: us-east-1
             subject: "PolyAI Alert"
+            send_resolved: true

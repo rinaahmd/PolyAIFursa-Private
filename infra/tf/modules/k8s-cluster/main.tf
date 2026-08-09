@@ -258,6 +258,17 @@ resource "aws_launch_template" "worker" {
 
   vpc_security_group_ids = [aws_security_group.worker.id]
 
+  # hop_limit=2 (default is 1) so pods can reach IMDS through the extra
+  # network hop the CNI (Calico) adds - otherwise only processes on the
+  # host's own network namespace can fetch instance-profile credentials,
+  # which breaks anything running as a Pod that needs AWS auth (e.g.
+  # Alertmanager's sigv4-signed SNS publish).
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 2
+    http_tokens                 = "optional"
+  }
+
   user_data = base64encode(templatefile("${path.module}/templates/worker_user_data.sh.tpl", {
     aws_region            = var.region
     ssm_join_command_path = var.ssm_join_command_path
