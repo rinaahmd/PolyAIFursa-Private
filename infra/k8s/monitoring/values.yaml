@@ -1,0 +1,42 @@
+prometheus:
+  prometheusSpec:
+    retention: 30d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ebs-sc
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 3Gi
+    serviceMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+grafana:
+  persistence:
+    enabled: true
+    storageClassName: ebs-sc
+    size: 1Gi
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: sns-default
+      group_by: ["alertname", "severity"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 3h
+      routes: []
+    receivers:
+      - name: sns-default
+        sns_configs:
+          - topic_arn: "arn:aws:sns:us-east-1:228281126655:rina-polyai-k8s-alerts"
+            sigv4:
+              region: us-east-1
+            subject: "PolyAI Alert"

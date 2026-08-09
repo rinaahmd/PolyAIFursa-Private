@@ -57,4 +57,5 @@ module "k8s_cluster" {
   worker_desired_capacity = var.worker_desired_capacity
   region                  = var.region
   ssm_join_command_path   = var.ssm_join_command_path
+  alert_email             = var.alert_email
 }

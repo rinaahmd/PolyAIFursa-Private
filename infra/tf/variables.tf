@@ -50,3 +50,8 @@ variable "ssm_join_command_path" {
   type        = string
   default     = "/rina-polyai-k8s/join-command"
 }
+
+variable "alert_email" {
+  description = "Email address subscribed to the alerting SNS topic; requires clicking the confirmation link AWS sends before alerts deliver"
+  type        = string
+}
