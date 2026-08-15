@@ -335,4 +335,21 @@ resource "aws_autoscaling_group" "worker" {
     value               = "rina"
     propagate_at_launch = true
   }
+
+  # Cluster Autoscaler auto-discovery tags (chart's default
+  # autoDiscovery.tags: k8s.io/cluster-autoscaler/{clusterName} and
+  # .../enabled) - these are what let CA find this ASG by tag search
+  # instead of a hardcoded --nodes=min:max:asg-name argument, so sizing
+  # changes here never require touching the CA Helm values.
+  tag {
+    key                 = "k8s.io/cluster-autoscaler/enabled"
+    value               = "true"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "k8s.io/cluster-autoscaler/rina-polyai-k8s"
+    value               = "owned"
+    propagate_at_launch = true
+  }
 }

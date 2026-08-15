@@ -1,0 +1,12 @@
+autoDiscovery:
+  clusterName: rina-polyai-k8s
+
+awsRegion: us-east-1
+cloudProvider: aws
+
+image:
+  tag: v1.30.7
+
+extraArgs:
+  balance-similar-node-groups: false
+  skip-nodes-with-local-storage: false

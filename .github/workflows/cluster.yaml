@@ -227,6 +227,30 @@ jobs:
               -n ingress-nginx --create-namespace \
               -f /home/ubuntu/ingress-nginx/values.yaml
 
+      - name: Deploy cluster-autoscaler values (idempotent)
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          source: "infra/k8s/cluster-autoscaler/values.yaml"
+          target: "/home/ubuntu/cluster-autoscaler"
+          strip_components: 3
+
+      - name: Install cluster-autoscaler (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          script: |
+            set -e
+            helm repo add autoscaler https://kubernetes.github.io/autoscaler
+            helm repo update
+            helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler \
+              -n kube-system --version 9.37.0 \
+              -f /home/ubuntu/cluster-autoscaler/values.yaml
+
       - name: Configure ArgoCD repo credentials (idempotent)
         uses: appleboy/ssh-action@v1
         with:
