@@ -301,8 +301,14 @@ resource "aws_launch_template" "worker" {
 }
 
 resource "aws_autoscaling_group" "worker" {
-  name                = "rina-polyai-k8s-worker-asg"
-  vpc_zone_identifier = var.subnet_ids
+  name = "rina-polyai-k8s-worker-asg"
+  # Pinned to a single subnet/AZ (matching where the monitoring EBS
+  # volumes already live) so a replacement worker can never land in an AZ
+  # that can't mount them - EBS volumes are AZ-local, and the ASG
+  # otherwise spreads across all of var.subnet_ids with no regard for
+  # existing PV placement, causing a "volume node affinity conflict"
+  # any time a new instance happens to land in the other AZ.
+  vpc_zone_identifier = [var.subnet_ids[1]]
   min_size            = var.worker_min_size
   max_size            = var.worker_max_size
   desired_capacity    = var.worker_desired_capacity
