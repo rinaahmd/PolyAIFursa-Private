@@ -32,7 +32,16 @@ alertmanager:
       group_wait: 30s
       group_interval: 5m
       repeat_interval: 3h
-      routes: []
+      routes:
+        # The control plane is intentionally stopped twice a day (account
+        # budget-keeper Lambda), which trips the chart's built-in
+        # component-health rules every time - these aren't real incidents,
+        # so route them to a null receiver instead of emailing. The two
+        # custom app alerts (AgentHighErrorRate, YoloHighRequestLatency)
+        # are untouched and still fall through to sns-default below.
+        - receiver: "null"
+          matchers:
+            - alertname =~ "KubeSchedulerInstanceUnreachable|KubeControllerManagerInstanceUnreachable|KubeProxyInstanceUnreachable|etcdMembersDown|etcdInsufficientMembers|TargetDown|Watchdog|KubeAPIDown|KubeletDown|InfoInhibitor"
     receivers:
       - name: sns-default
         sns_configs:
@@ -41,3 +50,4 @@ alertmanager:
               region: us-east-1
             subject: "PolyAI Alert"
             send_resolved: true
+      - name: "null"
