@@ -22,7 +22,7 @@ spec:
           # that's already built and confirmed running via Compose. The K8s
           # dev frontend NodePort origin is already in services/agent/app.py's
           # CORS allow_origins as of this SHA.
-          image: docker.io/rinaahmd/agent-service:5215304673881d12dd31d85e26230f3cd1c05fe2
+          image: docker.io/rinaahmd/agent-service:d4e0795eac7fbdbe82353e0ece3bf5c35e8d3be3
           ports:
             - name: http
               containerPort: 8000
@@ -66,6 +66,8 @@ kind: Service
 metadata:
   name: agent
   namespace: dev
+  labels:
+    app: agent
 spec:
   selector:
     app: agent

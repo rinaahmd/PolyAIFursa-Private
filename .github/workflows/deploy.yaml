@@ -43,7 +43,7 @@ jobs:
 
   deploy-agent:
     needs: changes
-    if: needs.changes.outputs.agent == 'true' || needs.changes.outputs.infra == 'true'
+    if: false  # TEMP: disabled to isolate cd.yaml test, revert after
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

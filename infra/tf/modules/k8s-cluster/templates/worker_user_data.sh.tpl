@@ -38,6 +38,27 @@ echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.
 apt-get update -y
 apt-get install -y kubelet kubeadm kubectl
 apt-mark hold kubelet kubeadm kubectl
+
+# --- Set kubelet's --provider-id (self-managed cluster, no AWS Cloud
+# Controller Manager) ---
+# Cluster Autoscaler's AWS provider maps Kubernetes Nodes back to EC2
+# instances/ASGs via Node.spec.providerID. Without a CCM nothing sets that
+# field automatically, so kubelet must be started with --provider-id
+# itself - format is aws:///<az>/<instance-id>, per
+# https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/aws/README.md
+# kubeadm's own systemd drop-in (10-kubeadm.conf) sources
+# /etc/default/kubelet as an EnvironmentFile and appends $KUBELET_EXTRA_ARGS
+# to the ExecStart line - that's the documented "last resort" override
+# path, so this has to be a plain KEY=VALUE file, not a systemd unit.
+IMDS_TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+AZ=$(curl -fsS -H "X-aws-ec2-metadata-token: $${IMDS_TOKEN}" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone)
+INSTANCE_ID=$(curl -fsS -H "X-aws-ec2-metadata-token: $${IMDS_TOKEN}" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+
+echo "KUBELET_EXTRA_ARGS=--provider-id=aws:///$${AZ}/$${INSTANCE_ID}" | tee /etc/default/kubelet
+
 systemctl enable --now kubelet
 
 # --- Install AWS CLI v2 (needed for SSM calls below) ---

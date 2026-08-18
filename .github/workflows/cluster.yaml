@@ -128,8 +128,128 @@ jobs:
             set -e
             kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
             kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --server-side --force-conflicts
-            kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -
-            kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Install Helm (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          script: |
+            set -e
+            if ! command -v helm >/dev/null 2>&1; then
+              curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
+              chmod 700 get_helm.sh
+              ./get_helm.sh
+              rm -f get_helm.sh
+            fi
+
+      - name: Install EBS CSI driver (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          command_timeout: 5m
+          script: |
+            set -e
+            helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+            helm repo update
+            helm upgrade --install aws-ebs-csi-driver aws-ebs-csi-driver/aws-ebs-csi-driver \
+              -n kube-system
+
+      - name: Deploy base manifests (idempotent)
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          source: "infra/k8s/base/"
+          target: "/home/ubuntu/k8s-base"
+          strip_components: 3
+
+      - name: Apply base manifests (namespaces, ebs-sc StorageClass)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          script: |
+            set -e
+            kubectl apply -f /home/ubuntu/k8s-base/
+
+      - name: Deploy kube-prometheus-stack values (idempotent)
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          source: "infra/k8s/monitoring/values.yaml"
+          target: "/home/ubuntu/monitoring"
+          strip_components: 3
+
+      - name: Install kube-prometheus-stack (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            set -e
+            helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+            helm repo update
+            helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+              -n monitoring --create-namespace \
+              -f /home/ubuntu/monitoring/values.yaml
+
+      - name: Deploy ingress-nginx values (idempotent)
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          source: "infra/k8s/ingress-nginx/values.yaml"
+          target: "/home/ubuntu/ingress-nginx"
+          strip_components: 3
+
+      - name: Install ingress-nginx (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          script: |
+            set -e
+            helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+            helm repo update
+            helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+              -n ingress-nginx --create-namespace \
+              -f /home/ubuntu/ingress-nginx/values.yaml
+
+      - name: Deploy cluster-autoscaler values (idempotent)
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          source: "infra/k8s/cluster-autoscaler/values.yaml"
+          target: "/home/ubuntu/cluster-autoscaler"
+          strip_components: 3
+
+      - name: Install cluster-autoscaler (idempotent)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ steps.cp.outputs.ip }}
+          username: ubuntu
+          key: ${{ secrets.K8S_SSH_KEY }}
+          script: |
+            set -e
+            helm repo add autoscaler https://kubernetes.github.io/autoscaler
+            helm repo update
+            helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler \
+              -n kube-system --version 9.37.0 \
+              -f /home/ubuntu/cluster-autoscaler/values.yaml
 
       - name: Configure ArgoCD repo credentials (idempotent)
         uses: appleboy/ssh-action@v1

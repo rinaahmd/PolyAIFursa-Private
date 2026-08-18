@@ -215,6 +215,22 @@ resource "aws_security_group" "worker" {
     cidr_blocks = [var.vpc_cidr]
   }
 
+  ingress {
+    description     = "Ingress Controller HTTP NodePort from the ALB"
+    from_port       = var.ingress_http_node_port
+    to_port         = var.ingress_http_node_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  ingress {
+    description     = "Ingress Controller HTTPS NodePort from the ALB"
+    from_port       = var.ingress_https_node_port
+    to_port         = var.ingress_https_node_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
   egress {
     description = "All outbound traffic"
     from_port   = 0
@@ -241,6 +257,17 @@ resource "aws_launch_template" "worker" {
   }
 
   vpc_security_group_ids = [aws_security_group.worker.id]
+
+  # hop_limit=2 (default is 1) so pods can reach IMDS through the extra
+  # network hop the CNI (Calico) adds - otherwise only processes on the
+  # host's own network namespace can fetch instance-profile credentials,
+  # which breaks anything running as a Pod that needs AWS auth (e.g.
+  # Alertmanager's sigv4-signed SNS publish).
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 2
+    http_tokens                 = "optional"
+  }
 
   user_data = base64encode(templatefile("${path.module}/templates/worker_user_data.sh.tpl", {
     aws_region            = var.region
@@ -274,8 +301,14 @@ resource "aws_launch_template" "worker" {
 }
 
 resource "aws_autoscaling_group" "worker" {
-  name                = "rina-polyai-k8s-worker-asg"
-  vpc_zone_identifier = var.subnet_ids
+  name = "rina-polyai-k8s-worker-asg"
+  # Pinned to a single subnet/AZ (matching where the monitoring EBS
+  # volumes already live) so a replacement worker can never land in an AZ
+  # that can't mount them - EBS volumes are AZ-local, and the ASG
+  # otherwise spreads across all of var.subnet_ids with no regard for
+  # existing PV placement, causing a "volume node affinity conflict"
+  # any time a new instance happens to land in the other AZ.
+  vpc_zone_identifier = [var.subnet_ids[1]]
   min_size            = var.worker_min_size
   max_size            = var.worker_max_size
   desired_capacity    = var.worker_desired_capacity
@@ -300,6 +333,23 @@ resource "aws_autoscaling_group" "worker" {
   tag {
     key                 = "Owner"
     value               = "rina"
+    propagate_at_launch = true
+  }
+
+  # Cluster Autoscaler auto-discovery tags (chart's default
+  # autoDiscovery.tags: k8s.io/cluster-autoscaler/{clusterName} and
+  # .../enabled) - these are what let CA find this ASG by tag search
+  # instead of a hardcoded --nodes=min:max:asg-name argument, so sizing
+  # changes here never require touching the CA Helm values.
+  tag {
+    key                 = "k8s.io/cluster-autoscaler/enabled"
+    value               = "true"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "k8s.io/cluster-autoscaler/rina-polyai-k8s"
+    value               = "owned"
     propagate_at_launch = true
   }
 }
