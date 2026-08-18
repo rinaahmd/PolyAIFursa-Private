@@ -27,21 +27,22 @@ alertmanager:
     global:
       resolve_timeout: 5m
     route:
-      receiver: sns-default
+      # Default receiver is null - this is a tiny single-node cluster, so
+      # the chart's default infra/resource-headroom rules (CPU overcommit,
+      # component-unreachable, etcd redundancy, etc.) trip constantly and
+      # aren't real incidents here. Only the two custom app alerts this
+      # assignment is built around get explicitly routed to email; every
+      # other alert (present or future) falls through to null by default,
+      # so no more allowlist edits every time a new default rule fires.
+      receiver: "null"
       group_by: ["alertname", "severity"]
       group_wait: 30s
       group_interval: 5m
       repeat_interval: 3h
       routes:
-        # The control plane is intentionally stopped twice a day (account
-        # budget-keeper Lambda), which trips the chart's built-in
-        # component-health rules every time - these aren't real incidents,
-        # so route them to a null receiver instead of emailing. The two
-        # custom app alerts (AgentHighErrorRate, YoloHighRequestLatency)
-        # are untouched and still fall through to sns-default below.
-        - receiver: "null"
+        - receiver: sns-default
           matchers:
-            - alertname =~ "KubeSchedulerInstanceUnreachable|KubeControllerManagerInstanceUnreachable|KubeProxyInstanceUnreachable|etcdMembersDown|etcdInsufficientMembers|TargetDown|Watchdog|KubeAPIDown|KubeletDown|InfoInhibitor"
+            - alertname =~ "AgentHighErrorRate|YoloHighRequestLatency"
     receivers:
       - name: sns-default
         sns_configs:
